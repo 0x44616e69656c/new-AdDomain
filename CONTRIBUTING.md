@@ -8,23 +8,26 @@ Open a GitHub issue. Include:
 
 - What you ran (the exact command line, with any secrets redacted)
 - What happened versus what you expected
-- Your VMware Workstation version and Windows host version
-- The Windows Server media you targeted (channel and image name; links appreciated if relevant)
-- The relevant lines from the CSV log and transcript in the `logs` folder
+- The Windows Server version and build the DC runs, and what it runs on (which hypervisor, or hardware)
+- Your build profile if you used one, and anything you changed in `include\global-config.ps1`
+- The relevant lines from the `logs` folder, meaning the transcript for each script, `ad-deploy-errors.csv`, and the `dcdiag` and `repadmin` reports
+- The functional test results, `test-results-<timestamp>.csv` in the `artifacts` folder
 - I love screenshots if they show something useful
+
+Leave the `users-<timestamp>` files out of the issue. They hold every generated user's password.
 
 If you would rather not use GitHub issues, reach out using the contact details in the README.
 
 ## Contributing Code: Fork and Pull Request
 
-This project accepts code changes through the fork and pull request model only. Direct pushes to `master` are not accepted.
+This project accepts code changes through the fork and pull request model only. Direct pushes to `main` are not accepted.
 
 1. **Fork** the repository to your own account.
 2. **Clone** your fork locally.
-3. **Create a branch** off `master` for your change (`git checkout -b fix/short-description`).
+3. **Create a branch** off `main` for your change (`git checkout -b fix/short-description`).
 4. **Make your change** and commit it with a clear message describing what and why.
 5. **Push** the branch to your fork.
-6. **Open a pull request** against this repository's `master` branch. Describe the problem, the fix, and how you tested it.
+6. **Open a pull request** against this repository's `main` branch. Describe the problem, the fix, and how you tested it.
 
 Keep each pull request focused on one logical change. Small, reviewable pull requests are merged faster than large ones.
 
@@ -39,7 +42,7 @@ Before you open a pull request, confirm your change meets these:
 - **Self-contained functions.** A function uses only its own parameters. If it needs an outside value, pass it in as a parameter rather than reading a global.
 - **Secrets stay out of the diff.** No real passwords, product keys, IP addresses, or paths from your environment in code, comments, or examples.
 - **Universally useful.** If a change is weird and only for your environment or moves away from test-lab builds, that is what your fork is for.
-- **Describe your testing.** State what you ran the change against (Workstation version, media). End-to-end validation to date is against Windows Server 2025 evaluation media on VMware Workstation Pro 26H1; note it if you tested other media or versions.
+- **Describe your testing.** State what you ran the change against (Windows Server version and build, functional levels, and whether a build profile was used). End-to-end validation to date is on Windows Server 2025 (build 26100) VMs, with no profile and with profiles at the `WinThreshold` and `Win2025` levels. Note it if you tested other versions.
 
 ## Questions
 

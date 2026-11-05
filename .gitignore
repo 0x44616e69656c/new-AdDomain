@@ -1,6 +1,8 @@
 /junk
 /logs
 /artifacts
+/tests
+include/build-profile.psd1
 .gitignore-publish
 journal.md
 gotchas.md

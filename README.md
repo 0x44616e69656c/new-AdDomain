@@ -6,18 +6,45 @@
 
 Stands up a fresh Windows Server 2025 Active Directory forest and fills it with realistic-looking users, groups, computers, service accounts, GPOs, and a certificate authority. Built for labs, demos, red-team ranges, and SIEM testing, not for production.
 
-This came out of a need to build a domain that looks lived-in for testing, and I did not want to click through the promotion wizard and then build users, groups, computers, etc. I wanted a solution that did not have any requirements not already built into Windows (Ansible etc.) This does all that and more with PowerShell 5.1.
+This came out of a need to build a domain that looks lived-in for testing, and I did not want to click through the promotion wizard and then build users, groups, computers, etc. I wanted a solution that did not have any requirements not already built into Windows (Ansible, etc.). This does all that and more with PowerShell 5.1.
 
 ## What It Does
 
 Two scripts run in sequence, split by the promotion reboot. Everything that has to happen before the box is a domain controller lives in script one. Everything that needs a running DC lives in script two.
 
 1. **`New-ADForestDeployment.ps1`** (run as local Administrator, pre-domain). Runs pre-flight checks, sets a static IP on the wired NIC, installs AD DS / DNS / management tools, promotes the server as a new forest root DC, optionally registers a scheduled task to auto-run script two, then reboots.
-2. **`Initialize-ADDirectory.ps1`** (run as Domain Administrator, post-promotion). Enables the AD Recycle Bin, deploys an Enterprise Root CA, sets DNS forwarders and time sync, validates the firewall, builds the OU tree, then populates users, groups (with nesting), computers, service accounts, GPOs, password policy, and a site topology. Finishes with functional tests and CSV/JSON artifacts.
+2. **`Initialize-ADDirectory.ps1`** (run as Domain Administrator, post-promotion). Enables the AD Recycle Bin, deploys an Enterprise Root CA, sets DNS forwarders and time sync, validates the firewall, builds the OU tree, then populates users, groups (with nesting), computers, service accounts, GPOs, and password policy, and puts the DC in its own site with its own subnet. Finishes with functional tests and CSV/JSON artifacts.
 
 Script two does not run on its own. The scheduled task uses an **at-logon** trigger, so directory population starts the next time an Administrator logs into the DC after the reboot. Script one prints a red banner reminding you of exactly that. If you skip `-CreateScheduledTask`, you will need to run script two by hand after the reboot.
 
-Domain identity (`lab.local` / `LAB` out of the box) lives in one place: [include/global-config.ps1](include/global-config.ps1). Both scripts read it. Edit it there to build a different domain. More configuration notes are found in the Configuration Notes section of this document.
+Domain identity (`lab.test` / `LAB` out of the box) lives in one place, [include/global-config.ps1](include/global-config.ps1). Both scripts read it. To build a different domain without editing that file, drop in a build profile, covered in the Build Profiles section below. More configuration notes are found in the Configuration Notes section of this document.
+
+## What's Changed Since 1.0
+
+1.0 built one forest, `lab.local`, unless you edited [include/global-config.ps1](include/global-config.ps1) by hand. 2.0 still builds the same lived-in domain in the same two steps. What changed is which forest you get, where the DC ends up in AD Sites and Services, and how loudly the scripts tell you a setting is wrong.
+
+**Thinking of upgrading?** 2.0 is a feature release, not a bug fix. If you don't need anything below, you may do better waiting for the next version. That one is planned to keep every setting you might change in an override file that upgrades leave alone, with a small script that moves your current edits into it. If you do upgrade now, [UPGRADE.md](UPGRADE.md) has the steps.
+
+### New in 2.0
+
+- **Build profiles.** A small `include\build-profile.psd1` names the domain, the NetBIOS name, the functional levels, the minimum build and the site for one build, and global-config.ps1 stays untouched. Both scripts read it. See [Build Profiles](#build-profiles).
+- **`Win2025` functional levels.** `ForestMode` and `DomainMode` take `WinThreshold` or `Win2025`. Once the AD DS role is installed, script one checks both names against what the installed `Install-ADDSForest` accepts, and a name it does not accept stops the run before promotion.
+- **The DC lands in its own site.** Script two renames `Default-First-Site-Name` to your site name and gives it the subnet the DC's address sits in. See [The DC's site](#the-dcs-site).
+- **SPNs follow the domain.** The SPNs in [config/serviceaccounts.csv](config/serviceaccounts.csv) use a `{DomainName}` placeholder, so they name hosts in whatever domain you build. See [Service account SPNs](#service-account-spns).
+- **Six more functional tests.** The test results file now has fifteen rows. The new ones check the DC's site subnet, the requested subnet, the site name, site link membership, the site's locator record in DNS, and the service account SPNs.
+
+### Changed behavior (read this if you used 1.0)
+
+- **The default domain is `lab.test`, not `lab.local`.** If you still run a lab built by 1.0, see [An existing lab on lab.local](#an-existing-lab-on-lablocal).
+- **The site step works differently.** 1.0 created a separate `Lab-HQ` site with a fixed `10.0.0.0/24` subnet and left the DC sitting in `Default-First-Site-Name`. 2.0 renames the DC's own site instead, and builds the subnet from the DC's address unless you name one that contains it.
+- **A clash gets reported instead of skipped.** 1.0 skipped a site that already existed, with one INFO line. Now a taken site name, a DC already in another site, or a subnet that belongs to another site gets a WARN and a failed test row, and the build carries on.
+- **Bad settings stop the run before anything changes.** A misspelled profile key or a functional level other than `WinThreshold` and `Win2025` stops script one before it changes the server. A misspelled SPN placeholder stops script two before it creates anything in the directory. The ERROR lines name the file and the setting at fault. You can no longer hit the old "`$forestName` must equal `$domainName`" error, because `$forestName` now follows `$domainName` on its own.
+- **The minimum build is checked now.** `RequiredOSBuild` is the oldest Windows build script one will run on. In 1.0 a comment said not to set it below 14393 (Server 2016), but nothing enforced that. In 2.0 a value below 17763 (Server 2019) is raised to 17763 with a warning, and a value below 26100 is raised to 26100 when either functional level is `Win2025`, since that level needs Server 2025. The shipped value is still 26100, so out of the box only Server 2025 passes. Nothing below 26100 has been tested. Server 2019 and 2022 are allowed because the lab is meant to cover them, but whether a build on either one works is still a guess.
+
+### Under the hood
+
+- **CSV files are written as UTF-8 with a byte order mark.** On Windows PowerShell 5.1, 1.0 wrote `ad-deploy-errors.csv`, `users-<timestamp>.csv` and `test-results-<timestamp>.csv` in the default encoding, which turns a surname like Müller into `M?ller`.
+- **global-config.ps1 is laid out in three parts.** The base values come first, then the profile load and its checks, then the values derived from the domain, such as the OU paths. Each base value starts out empty, so a deleted line shows up as an empty setting instead of quietly picking up a variable of the same name from whatever ran the file.
 
 ## Screenshots
 
@@ -31,7 +58,7 @@ Domain identity (`lab.local` / `LAB` out of the box) lives in one place: [includ
 
 ![Console output showing Install-ADDSForest validating environment and user input](images/s1_2.jpg)
 
-3. **Promotion in progress.** The DNS delegation warning is expected for a new forest root with no parent zone; no action needed.
+3. **Promotion in progress.** The DNS delegation warning is expected for a new forest root with no parent zone. No action needed.
 
 ![Console output showing forest installation starting, with an expected DNS delegation warning](images/s1_3.jpg)
 
@@ -41,7 +68,7 @@ Domain identity (`lab.local` / `LAB` out of the box) lives in one place: [includ
 
 ![Console output showing service readiness checks and AD Recycle Bin being enabled](images/s2_1.jpg)
 
-5. **CA, firewall check, and OU structure.** Enterprise Root CA deployed, then `Test-FirewallRules` validates DC/CA ports -- the WARN lines are informational, since the function only validates and does not create rules. CSV validation and OU creation follow.
+5. **CA, firewall check, and OU structure.** Enterprise Root CA deployed, then `Test-FirewallRules` validates DC/CA ports. The WARN lines are informational, since the function only validates and does not create rules. CSV validation and OU creation follow.
 
 ![Console output showing Enterprise Root CA deployment, firewall rule verification, and OU creation](images/s2_2.jpg)
 
@@ -49,7 +76,7 @@ Domain identity (`lab.local` / `LAB` out of the box) lives in one place: [includ
 
 ![Console output showing group creation complete and user creation progress](images/s2_3.jpg)
 
-7. **Wrap-up and functional tests.** Service accounts, GPOs, password policy, and site topology configured; functional tests confirm the build.
+7. **Wrap-up and functional tests.** Service accounts, GPOs, password policy, and site topology configured. Functional tests confirm the build.
 
 ![Console output showing service account creation, GPO deployment, and functional test results](images/s2_4.jpg)
 
@@ -73,7 +100,7 @@ Domain identity (`lab.local` / `LAB` out of the box) lives in one place: [includ
 
 ### Artifacts
 
-12. **Functional test results.** `test-results-<timestamp>.csv`, one PASS/FAIL row per check -- LDAP query, DNS resolution, Domain Admins membership, CA status, and more.
+12. **Functional test results.** `test-results-<timestamp>.csv`, one PASS/FAIL row per check, covering the LDAP query, DNS resolution, Domain Admins membership, CA status, and more.
 
 ![Functional test results CSV opened in a text editor, showing PASS rows for each check](images/log_1.jpg)
 
@@ -83,9 +110,9 @@ Domain identity (`lab.local` / `LAB` out of the box) lives in one place: [includ
 
 ## Requirements
 
-- **Windows Server 2025** (build 26100 or later). Script one refuses to run on anything older. All PowerShell modules used should be available as far back as Windows 2016. Domain Level is 2016. If you want to use an earlier version, change `$requiredOSBuild` in the config file. I have only tested on Server 2025.
+- **Windows Server 2019, 2022 or 2025** (build 17763 at the lowest), at the `WinThreshold` or `Win2025` functional level. `Win2025` needs Server 2025 domain controllers. Out of the box script one wants build 26100 and refuses anything older, because Server 2025 is the only release I have tested. To run on Server 2019 or 2022, set `RequiredOSBuild` in a build profile. I have only tested on Server 2025.
 - **PowerShell 5.1.** PowerShell 7 is not supported or tested. Without extra work it will not run, because both scripts depend on Windows PowerShell only modules. The scheduled task and both scripts assume `powershell.exe`.
-- **Local Administrator** rights for script one; **Domain Administrator** rights for script two.
+- **Local Administrator** rights for script one, and **Domain Administrator** rights for script two.
 - **A clean server.** No existing AD DS role, no AD CS role, not already domain-joined, and the target domain name must not already resolve in DNS. Script one checks all of this and stops if any of it is true.
 
 AD CS is deliberately left out of script one. `Install-ADDSForest` will not promote a server that already has Certificate Server installed, so the CA role goes in post-promotion inside script two.
@@ -94,7 +121,7 @@ The RSAT AD tools and GPMC that script two needs are installed by script one dur
 
 ## Tested On
 
-- **Windows Server 2025 (build 26100).** Promotion through full directory population, run end to end on a live VM.
+- **Windows Server 2025 (build 26100).** Promotion through full directory population, run end to end on live VMs. 2.0 was run with no profile, with a profile at the `WinThreshold` level, with a profile at the `Win2025` level, and with profiles built to clash with an existing site and subnet.
 
 The unattended path (`-NonInteractive` with supplied network parameters) exists so an outside orchestrator can drive script one over VMware guest operations without a console to prompt at. That orchestration script is not part of this repo. I have another project that does this.
 
@@ -107,7 +134,7 @@ git clone https://github.com/0x44616e69656c/new-AdDomain.git
 cd new-AdDomain
 ```
 
-Edit [include/global-config.ps1](include/global-config.ps1) if you want something other than `lab.local` / `LAB`, then run script one from an elevated prompt on a clean Server 2025 box:
+If you want something other than `lab.test` / `LAB`, add a build profile (see Build Profiles) or edit [include/global-config.ps1](include/global-config.ps1). Then run script one from an elevated prompt on a clean Server 2025 box:
 
 ```powershell
 .\New-ADForestDeployment.ps1 -CreateScheduledTask
@@ -166,7 +193,54 @@ A smaller, reproducible population with computer objects included:
 | `-MaxGroupNestingDepth` | `3` | Deepest group-in-group nesting. |
 | `-RandomSeed` | `0` | Seeds the RNG for a reproducible run. `0` means no seed (fresh randomness each run). |
 
-Domain name, NetBIOS name, OU layout, CA settings, password policy, and the user-state percentages are configuration, not parameters. They live in [include/global-config.ps1](include/global-config.ps1).
+Domain name, NetBIOS name, OU layout, CA settings, password policy, and the user-state percentages are configuration, not parameters. They live in [include/global-config.ps1](include/global-config.ps1). A build profile can override the domain, the functional levels, the minimum build and the site for one build.
+
+## Build Profiles
+
+A build profile lets you build a different forest without touching [include/global-config.ps1](include/global-config.ps1). It is a PowerShell data file at `include\build-profile.psd1`. Both scripts read it when it is there, and anything it leaves out takes the global-config.ps1 value. The file name is in `.gitignore`, so a profile you drop in for one build never gets committed by accident.
+
+```powershell
+@{
+    DomainName      = 'corp.example.test'
+    NetBIOSName     = 'CORP'
+    PrimarySiteName = 'Corp-HQ'
+    PrimarySubnet   = 'Auto'
+}
+```
+
+Each key overrides the global-config.ps1 variable of the same name, with a capital first letter.
+
+| Key | Overrides | Valid values |
+|---|---|---|
+| `DomainName` | `$domainName` | Two or more labels of letters, digits and hyphens, 64 characters at most. `$forestName` follows it. |
+| `NetBIOSName` | `$netBIOSName` | 1 to 15 letters, digits or hyphens, not digits only, not a reserved word. Leave it out and the first label of `DomainName`, upper-cased, is used with a warning. |
+| `ForestMode` | `$forestMode` | `WinThreshold` or `Win2025` |
+| `DomainMode` | `$domainMode` | `WinThreshold` or `Win2025`, never lower than `ForestMode` |
+| `RequiredOSBuild` | `$requiredOSBuild` | 17763 or higher |
+| `PrimarySiteName` | `$primarySiteName` | 1 to 63 letters, digits or hyphens |
+| `PrimarySubnet` | `$primarySubnet` | `Auto`, or an IPv4 subnet such as `192.168.159.0/24` |
+
+The rule is that a forgotten or recycled setting never fails a build. A key you leave out takes the global-config.ps1 value and gets one INFO line. An empty value takes the same fallback with a warning. So does a value that clashes, such as a minimum build too low for `Win2025`, which gets raised. The run stops only for a typo or for something the build cannot do, like an unknown key or a level other than `WinThreshold` and `Win2025`. Every line names where the value came from, the profile or global-config.ps1, so you know which file to fix. The same checks apply to global-config.ps1 itself.
+
+Keys for features that do not exist yet (`RandomSeed`, `Machines`, `Trusts` and a few others) are refused rather than quietly ignored. A profile should never look like it did something the build did not.
+
+### Service account SPNs
+
+The SPNs in [config/serviceaccounts.csv](config/serviceaccounts.csv) name their hosts with a `{DomainName}` placeholder, for example `MSSQLSvc/sql01.{DomainName}:1433`. Script two swaps in the build's domain when it creates the account. An SPN you write without the placeholder is kept exactly as written. A misspelled placeholder like `{Domain}` stops script two before it creates anything in the directory, and the error names the CSV row.
+
+### An existing lab on lab.local
+
+The default domain moved from `lab.local` to `lab.test`. RFC 6762 reserves `.local` for multicast DNS, and RFC 2606 reserves `.test` for testing. If you still run a lab built on the old name, this profile keeps the scripts pointed at it:
+
+```powershell
+@{ DomainName = 'lab.local'; NetBIOSName = 'LAB' }
+```
+
+You will get a warning about `.local`. That is the build telling you something you already know.
+
+### The DC's site
+
+Script two renames `Default-First-Site-Name` to the requested site name (`Lab-HQ` unless you say otherwise), so the DC stays in the default site link. With `PrimarySubnet` at `Auto` it creates the subnet the DC's own address sits in, which is the only value that is right on every host. An explicit subnet is used when it contains the DC's address. If the name is already taken, the DC already sits in another site, or the subnet belongs to another site, the build carries on. It logs a warning and fails the matching test row instead.
 
 ## Logs
 
@@ -191,6 +265,8 @@ Script two writes a snapshot of what it built to `artifacts\`:
 - `users-<timestamp>.csv` and `users-<timestamp>.json` -- every user created, with a subset of attributes. **This includes passwords for users.**
 - `test-results-<timestamp>.csv` -- pass/fail rows from the functional test pass.
 
+Both CSV files are written as UTF-8 with a byte order mark, so accented names come through intact.
+
 ## Configuration Notes
 
 Configuration defaults are found in [include/global-config.ps1](include/global-config.ps1).
@@ -199,7 +275,7 @@ Text configuration files (names, departments, etc.) are found in the [config](co
 A few choices in [include/global-config.ps1](include/global-config.ps1) are deliberate. Do not "fix" them unless you understand what you are doing and don't report bugs if changes break things:
 
 - **`$usersOU` is `OU=Employees`, not `OU=Users`.** An OU named `Users` collides with the built-in `CN=Users` container at the domain root.
-- **`$forestName` must equal `$domainName`.** This builds a new forest root domain, so the two are the same. Script one refuses to run if they differ.
+- **`$forestName` always equals `$domainName`.** This builds a new forest root domain, so the two are the same, and the config sets one from the other.
 - **The DSRM password is hardcoded in script one.** It is a lab tool. The variable is named `$dsrmPwDontDoThisInProd` so nobody mistakes the intent. Technically I guess you can change this one, but it's a lab.
 - **Enterprise CA database and log share one directory.** Fine for a lab, not what you would do in production.
 
@@ -207,8 +283,8 @@ A few choices in [include/global-config.ps1](include/global-config.ps1) are deli
 
 - **Lab and demo only.** Hardcoded DSRM credential, a self-signed-style Enterprise CA, and a wide-open functional model. This is not a hardened build and is not meant to be.
 - **New forest root only.** It does not join an existing forest, add a child domain, or add a replica DC.
-- **Single DC, single site.** One site and one subnet are created. No replication topology beyond that.
-- **Population is only partly idempotent.** OUs, service accounts, computer objects, GPOs, and sites are skipped if they already exist, but re-running script two adds a fresh batch of randomly generated users and groups and re-rolls their memberships. Start from a clean promotion for a predictable result.
+- **Single DC, single site.** The DC's site is renamed and given one subnet. No replication topology beyond that.
+- **Population is only partly idempotent.** OUs, service accounts, computer objects, and GPOs are skipped if they already exist, and the site step keeps whatever site the DC already sits in, but re-running script two adds a fresh batch of randomly generated users and groups and re-rolls their memberships. Start from a clean promotion for a predictable result.
 
 ## Troubleshooting
 
@@ -220,7 +296,7 @@ A few choices in [include/global-config.ps1](include/global-config.ps1) are deli
 
 **Script one hangs with no output on an unattended VM.** -- A prompt is waiting on a console that is not there. Re-run with `-NonInteractive` and supply `-StaticIpAddress`, `-PrefixLength`, `-DefaultGateway`, and `-AdapterName` as needed.
 
-**"For a new forest root domain, $forestName must equal $domainName."** -- Set both to the same value in [include/global-config.ps1](include/global-config.ps1).
+**"Stopping before any change: the build profile check failed."** -- The ERROR lines just above it name the file (the build profile or global-config.ps1) and the key or variable at fault. Fix that value and run the script again.
 
 ## Contact
 

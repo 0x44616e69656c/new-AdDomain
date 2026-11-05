@@ -5,20 +5,34 @@
     Validates domain services, enables the Recycle Bin, deploys the Enterprise CA,
     configures DNS forwarders, time synchronization, and firewall, creates the OU hierarchy, and
     populates the directory with users, groups, computers, and service accounts.
-    Deploys baseline GPOs, configures the password policy, creates AD site topology,
-    runs functional validation tests, and exports summary artifacts.
+    Deploys baseline GPOs, configures the password policy, puts the DC in its primary
+    site with the DC's own subnet, runs functional validation tests, and exports
+    summary artifacts.
+
+    The domain and site values come from include\global-config.ps1 and, when present,
+    the build profile include\build-profile.psd1. The profile's results are logged
+    after the "started" line, and a profile error stops the run before anything is
+    changed. Service account SPNs in config\serviceaccounts.csv may name hosts with the
+    {DomainName} placeholder, which is replaced with the build's domain.
+
+    The site step renames Default-First-Site-Name to the requested site name, so the DC
+    stays in the default site link, and creates the subnet the DC's address sits in
+    ('Auto') or the requested subnet when it contains that address. A name already
+    taken, a DC already in another site, or a subnet held by another site is reported
+    with a warning and a failed test row, never a stop.
 
     Removes the AD-Populate-PostPromotion scheduled task on startup if present,
-    so it does not re-run at subsequent logons.
+    so it does not re-run at subsequent logons. The CSV files are validated first, so
+    a CSV fix plus a logon re-runs population.
 
     Run as: Domain Administrator (post-promotion).
 .EXAMPLE
     .\Initialize-ADDirectory.ps1
     .\Initialize-ADDirectory.ps1 -UserCount 500 -GroupCount 25
 .NOTES
-    Version:      1.0.0
+    Version:      2.0.0
     Author:       Daniel Owen
-    Release Date: 2026-06-01
+    Release Date: 2026-11-05
     Requirements: Windows Server 2025, PowerShell 5.1+, Domain Administrator
 #>
 
@@ -394,7 +408,10 @@ function Export-DiagnosticReports {
 
 #region --- CSV Validation ---
 function Test-AllCsvFiles {
-    param([string]$CsvBasePath)
+    param(
+        [string]$CsvBasePath,
+        [string]$DomainNameParam
+    )
     $failures = @()
     $csvSpecs  = @(
         @{ File = 'first.csv';           Headers = @('FirstName');                 MinRows = 50  },
@@ -432,6 +449,19 @@ function Test-AllCsvFiles {
             }
         } catch {
             $failures += "UNREADABLE: $($spec.File) -- $_"
+        }
+    }
+
+    # A brace left in an SPN after {DomainName} substitution is a misspelled placeholder
+    # such as {Domain}. Test-ServicePrincipalNamePlaceholder comes from include\BuildProfile.ps1.
+    $serviceAccountCsvPath = Join-Path $CsvBasePath 'serviceaccounts.csv'
+    if (Test-Path $serviceAccountCsvPath) {
+        try {
+            foreach ($placeholderRow in @(Test-ServicePrincipalNamePlaceholder -CsvPath $serviceAccountCsvPath -DomainName $DomainNameParam)) {
+                $failures += "UNRESOLVED PLACEHOLDER in serviceaccounts.csv row $($placeholderRow.RowNumber) (Name '$($placeholderRow.Name)'): SPN '$($placeholderRow.ServicePrincipalName)' still holds a brace after {DomainName} substitution ('$($placeholderRow.ResolvedServicePrincipalName)'). Write the placeholder as {DomainName}."
+            }
+        } catch {
+            $failures += "UNREADABLE: serviceaccounts.csv -- $_"
         }
     }
 
@@ -1033,7 +1063,8 @@ function New-ServiceAccounts {
     param(
         [array]$ServiceAccountDefs,
         [string]$TargetOU,
-        [int]$PasswordLengthParam
+        [int]$PasswordLengthParam,
+        [string]$DomainNameParam
     )
     foreach ($def in $ServiceAccountDefs) {
         try {
@@ -1059,7 +1090,8 @@ function New-ServiceAccounts {
             }
             if ($def.SPN -and $def.SPN.Trim() -ne '') {
                 $localSamForSpn = $samName
-                $localSpn       = $($def.SPN)
+                # {DomainName} becomes the build's domain. An SPN without it is written as given.
+                $localSpn       = Resolve-ServicePrincipalName -ServicePrincipalName $($def.SPN) -DomainName $DomainNameParam
                 Invoke-ADWriteWithRetry -OperationName "Set-SPN $localSamForSpn" -Operation {
                     $null = Set-ADUser -Identity $localSamForSpn -ServicePrincipalNames @{ Add = $localSpn }
                 }
@@ -1211,35 +1243,391 @@ function Set-PasswordPolicy {
 #endregion
 
 #region --- AD Site Topology ---
-function Set-ADSiteTopology {
-    param(
-        [string]$PrimarySiteNameParam,
-        [string]$PrimarySubnetParam
-    )
-    try {
-        if (-not (Get-ADReplicationSite -Filter "Name -eq '$PrimarySiteNameParam'" -ErrorAction SilentlyContinue)) {
-            $localSiteName = $PrimarySiteNameParam
-            Invoke-ADWriteWithRetry -OperationName "New-ADReplicationSite $localSiteName" -Operation {
-                $null = New-ADReplicationSite -Name $localSiteName
-            }
-            Write-LogSuccess "Created AD site: $PrimarySiteNameParam"
-        } else {
-            Write-LogInfo "AD site already exists, skipping: $PrimarySiteNameParam"
-        }
+function ConvertTo-LdapFilterValue {
+    # Escapes a value for an LDAP filter (RFC 4515): backslash, asterisk, parentheses, NUL.
+    param([Parameter(Mandatory)][string]$Value)
+    $escaped = $Value.Replace('\', '\5c').Replace('*', '\2a').Replace('(', '\28').Replace(')', '\29')
+    return $escaped.Replace([string][char]0, '\00')
+}
 
-        if (-not (Get-ADReplicationSubnet -Filter "Name -eq '$PrimarySubnetParam'" -ErrorAction SilentlyContinue)) {
-            $localSubnet   = $PrimarySubnetParam
-            $localSiteName = $PrimarySiteNameParam
-            Invoke-ADWriteWithRetry -OperationName "New-ADReplicationSubnet $localSubnet" -Operation {
-                $null = New-ADReplicationSubnet -Name $localSubnet -Site $localSiteName
+function Get-DomainControllerSite {
+    # Reads the DC's site from its server object under CN=Sites in the configuration
+    # partition: the server object whose serverReference holds this DC's computer DN.
+    # Not from the DC locator, so a site renamed seconds earlier reads correctly.
+    # Returns the site object (Name, DistinguishedName). Throws when it can't be read.
+    param(
+        [Parameter(Mandatory)][string]$ComputerNameParam,
+        [Parameter(Mandatory)][string]$ConfigurationNCParam
+    )
+    $computerDN    = (Get-ADComputer -Identity $ComputerNameParam).DistinguishedName
+    $serverObjects = @(Get-ADObject -SearchBase "CN=Sites,$ConfigurationNCParam" -LDAPFilter "(&(objectClass=server)(serverReference=$(ConvertTo-LdapFilterValue -Value $computerDN)))")
+    if ($serverObjects.Count -ne 1) {
+        throw "Found $($serverObjects.Count) server objects under CN=Sites for '$computerDN', not exactly one."
+    }
+    $serverDN = [string]$serverObjects[0].DistinguishedName
+    $dcSites  = @(Get-ADReplicationSite -Filter * | Where-Object {
+        $serverDN.EndsWith(",CN=Servers,$($_.DistinguishedName)", [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    if ($dcSites.Count -ne 1) {
+        throw "Found $($dcSites.Count) sites holding the server object '$serverDN', not exactly one."
+    }
+    return $dcSites[0]
+}
+
+function Get-DomainControllerIPv4Address {
+    # Works out the DC's IPv4 address and prefix length: the address AD holds for this DC
+    # when it is on a local adapter, otherwise the one manual IPv4 address when there is
+    # exactly one. IPAddress is $null when neither gives an answer.
+    param([Parameter(Mandatory)][string]$ComputerNameParam)
+    $adAddress = $null
+    try {
+        $adAddress = [string](Get-ADDomainController -Identity $ComputerNameParam).IPv4Address
+    } catch {
+        $adAddress = $null
+    }
+    $localAddresses = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+    if ($adAddress) {
+        $adAddressEntry = @($localAddresses | Where-Object { [string]$_.IPAddress -eq $adAddress })
+        if ($adAddressEntry.Count -ge 1) {
+            return [pscustomobject]@{ IPAddress = $adAddress; PrefixLength = [int]$adAddressEntry[0].PrefixLength; Source = 'the address AD holds for this DC'; AdAddress = $adAddress; ManualCount = 0 }
+        }
+    }
+    $manualAddresses = @($localAddresses | Where-Object { [string]$_.PrefixOrigin -eq 'Manual' })
+    if ($manualAddresses.Count -eq 1) {
+        return [pscustomobject]@{ IPAddress = [string]$manualAddresses[0].IPAddress; PrefixLength = [int]$manualAddresses[0].PrefixLength; Source = 'the only manual IPv4 address on this server'; AdAddress = $adAddress; ManualCount = 1 }
+    }
+    return [pscustomobject]@{ IPAddress = $null; PrefixLength = 0; Source = $null; AdAddress = $adAddress; ManualCount = $manualAddresses.Count }
+}
+
+function Get-FreeSiteName {
+    # The next free suffixed name for a site: <base>-2, <base>-3 and so on, compared
+    # without regard to case. The base is shortened so the whole name stays within 63
+    # characters, and a hyphen left at the end of the shortened base is trimmed.
+    param(
+        [Parameter(Mandatory)][string]$BaseNameParam,
+        [AllowEmptyCollection()][string[]]$ExistingNamesParam = @()
+    )
+    for ($suffixNumber = 2; ; $suffixNumber++) {
+        $suffix   = "-$suffixNumber"
+        $baseName = $BaseNameParam
+        if ($baseName.Length + $suffix.Length -gt 63) {
+            $baseName = $baseName.Substring(0, 63 - $suffix.Length).TrimEnd('-')
+        }
+        $candidateName = "$baseName$suffix"
+        if (@($ExistingNamesParam | Where-Object { $_ -eq $candidateName }).Count -eq 0) {
+            return $candidateName
+        }
+    }
+}
+
+function Invoke-NltestDsRegDns {
+    # Runs nltest /dsregdns, which makes Netlogon register the DC's DNS records at once.
+    # Returns the exit code and the output on one line. A separate function so the
+    # offline tests can stand in for it.
+    $ErrorActionPreference = 'Continue'    # stderr from a native command must not throw here
+    $nltestPath   = Join-Path -Path $env:SystemRoot -ChildPath 'System32\nltest.exe'
+    $nltestOutput = & $nltestPath /dsregdns 2>&1
+    $nltestExit   = $LASTEXITCODE
+    return [pscustomobject]@{
+        ExitCode = $nltestExit
+        Output   = ((@($nltestOutput) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join ' ')
+    }
+}
+
+function Set-ADSiteTopology {
+    # Puts the DC in its primary site and gives that site the DC's subnet. Never throws.
+    # Site cases, checked in order: 1, the DC is already in a site with the requested
+    # name; 2, it is in Default-First-Site-Name and the name is free, so that site is
+    # renamed; 3, it is in Default-First-Site-Name and the name is taken, so the site
+    # is renamed to the next free suffixed name; 4, it is in another site, which is kept.
+    # Renaming rather than moving keeps the DC's site in DEFAULTIPSITELINK.
+    # Returns what it ended with, for the test rows.
+    param(
+        [Parameter(Mandatory)][string]$PrimarySiteNameParam,
+        [Parameter(Mandatory)][string]$PrimarySubnetParam,
+        [Parameter(Mandatory)][string]$DomainNameParam,
+        [Parameter(Mandatory)][string]$ComputerNameParam,
+        [int]$RenameAttemptLimitParam = 5
+    )
+    $defaultSiteName = 'Default-First-Site-Name'
+    $result = [pscustomobject]@{
+        RequestedSiteName     = $PrimarySiteNameParam
+        SiteName              = $null
+        SiteDistinguishedName = $null
+        SiteCase              = 0
+        RequestedSubnet       = $PrimarySubnetParam
+        Subnet                = $null
+        SubnetFellBackToAuto  = $false
+        DcAddress             = $null
+        DcPrefixLength        = 0
+        SubnetHeldBySite      = $null
+        ConfigurationNC       = $null
+        StepError             = $null
+    }
+    try {
+        $configurationNC        = [string](Get-ADRootDSE).configurationNamingContext
+        $result.ConfigurationNC = $configurationNC
+
+        #region Site
+        $dcSite = Get-DomainControllerSite -ComputerNameParam $ComputerNameParam -ConfigurationNCParam $configurationNC
+        $allSites = @(Get-ADReplicationSite -Filter *)
+        if ($dcSite.Name -eq $PrimarySiteNameParam) {
+            $result.SiteCase = 1
+            Write-LogInfo "Site topology: the DC is already in site '$($dcSite.Name)', the requested name. No rename needed."
+        } elseif ($dcSite.Name -eq $defaultSiteName) {
+            if (@($allSites | Where-Object { $_.Name -eq $PrimarySiteNameParam }).Count -eq 0) {
+                $result.SiteCase = 2
+                $candidateName   = $PrimarySiteNameParam
+            } else {
+                $result.SiteCase = 3
+                $candidateName   = Get-FreeSiteName -BaseNameParam $PrimarySiteNameParam -ExistingNamesParam @($allSites | ForEach-Object { [string]$_.Name })
             }
-            Write-LogSuccess "Created subnet: $PrimarySubnetParam in site $PrimarySiteNameParam"
+            $renamed = $false
+            for ($renameAttempt = 1; $renameAttempt -le $RenameAttemptLimitParam; $renameAttempt++) {
+                # One attempt per name, then a re-read: a retried rename after a lost reply
+                # would fail on the name that already took.
+                $renameError = $null
+                try {
+                    Rename-ADObject -Identity $dcSite.DistinguishedName -NewName $candidateName
+                } catch {
+                    $renameError = $_
+                }
+                $dcSiteNow = Get-DomainControllerSite -ComputerNameParam $ComputerNameParam -ConfigurationNCParam $configurationNC
+                if ($dcSiteNow.Name -eq $candidateName) {
+                    $dcSite  = $dcSiteNow
+                    $renamed = $true
+                    break
+                }
+                if ($null -eq $renameError) {
+                    $renameError = "the DC's site still reads '$($dcSiteNow.Name)' after the rename"
+                }
+                Write-LogWarn "Site topology: renaming site '$defaultSiteName' to '$candidateName' failed: $(Get-BuildProfileSingleLine -Text "$renameError"). The DC is in site '$($dcSiteNow.Name)'; keeping it."
+                $dcSite = $dcSiteNow
+                $sitesNow = @(Get-ADReplicationSite -Filter *)
+                $candidateNowTaken = @($sitesNow | Where-Object { $_.Name -eq $candidateName }).Count -gt 0
+                if ($dcSiteNow.Name -ne $defaultSiteName -or -not $candidateNowTaken) {
+                    break
+                }
+                # The name was taken between the read and the rename: try the next free one.
+                $result.SiteCase = 3
+                $candidateName   = Get-FreeSiteName -BaseNameParam $PrimarySiteNameParam -ExistingNamesParam @($sitesNow | ForEach-Object { [string]$_.Name })
+            }
+            if ($renamed) {
+                if ($result.SiteCase -eq 2) {
+                    Write-LogSuccess "Site topology: renamed site '$defaultSiteName' to '$PrimarySiteNameParam'. The DC is in site '$PrimarySiteNameParam'."
+                } else {
+                    Write-LogWarn "Site topology: a site named '$PrimarySiteNameParam' already exists and does not hold the DC; renamed '$defaultSiteName' to '$($dcSite.Name)' instead. The requested name was not applied. See the ""Primary site name"" test row."
+                }
+                $nltestResult = Invoke-NltestDsRegDns
+                if ($nltestResult.ExitCode -eq 0) {
+                    Write-LogInfo "Site topology: nltest /dsregdns succeeded."
+                } else {
+                    Write-LogWarn "Site topology: nltest /dsregdns failed with exit code $($nltestResult.ExitCode): $($nltestResult.Output). Netlogon was not forced to register the DC's records for site '$($dcSite.Name)'. See the ""Site locator record"" test row."
+                }
+            }
         } else {
-            Write-LogInfo "Subnet already exists, skipping: $PrimarySubnetParam"
+            $result.SiteCase = 4
+            Write-LogWarn "Site topology: the DC is in site '$($dcSite.Name)', not '$defaultSiteName'; keeping that site. The requested name '$PrimarySiteNameParam' was not applied. See the ""Primary site name"" test row."
+        }
+        $result.SiteName              = [string]$dcSite.Name
+        $result.SiteDistinguishedName = [string]$dcSite.DistinguishedName
+        #endregion
+
+        #region Subnet
+        $dcAddress = Get-DomainControllerIPv4Address -ComputerNameParam $ComputerNameParam
+        if (-not $dcAddress.IPAddress) {
+            $adAddressText = if ($dcAddress.AdAddress) { $dcAddress.AdAddress } else { 'no address' }
+            Write-LogWarn "Site topology: can't work out the DC's IPv4 address. AD holds $adAddressText for this DC, which is not on a local adapter, and this server has $($dcAddress.ManualCount) manual IPv4 addresses, not exactly one. Skipping the subnet step for PrimarySubnet $PrimarySubnetParam. See the ""DC site subnet"" test row."
+            return $result
+        }
+        $result.DcAddress      = $dcAddress.IPAddress
+        $result.DcPrefixLength = $dcAddress.PrefixLength
+        Write-LogInfo "Site topology: the DC's address is $($dcAddress.IPAddress)/$($dcAddress.PrefixLength), from $($dcAddress.Source)."
+
+        $autoSubnet = Get-IPv4NetworkAddress -IPAddress $dcAddress.IPAddress -PrefixLength $dcAddress.PrefixLength
+        if ($PrimarySubnetParam -eq 'Auto') {
+            $targetSubnet = $autoSubnet
+        } elseif (Test-IPv4AddressInSubnet -IPAddress $dcAddress.IPAddress -Subnet $PrimarySubnetParam) {
+            $targetSubnet = $PrimarySubnetParam
+        } else {
+            Write-LogWarn "Site topology: PrimarySubnet $PrimarySubnetParam does not contain the DC's address $($dcAddress.IPAddress); using Auto, $autoSubnet, instead. See the ""Requested subnet"" test row."
+            $targetSubnet                = $autoSubnet
+            $result.SubnetFellBackToAuto = $true
+        }
+        $result.Subnet = $targetSubnet
+
+        $existingSubnet = @(Get-ADObject -SearchBase "CN=Subnets,CN=Sites,$configurationNC" -LDAPFilter '(objectClass=subnet)' -Properties siteObject |
+            Where-Object { [string]$_.Name -eq $targetSubnet })
+        if ($existingSubnet.Count -gt 0) {
+            $subnetSiteDN = [string]$existingSubnet[0].siteObject
+            if ($subnetSiteDN -and $subnetSiteDN -eq $dcSite.DistinguishedName) {
+                Write-LogInfo "Site topology: subnet $targetSubnet is already in site '$($dcSite.Name)'."
+            } elseif (-not $subnetSiteDN) {
+                $result.SubnetHeldBySite = ''
+                Write-LogWarn "Site topology: subnet $targetSubnet already exists with no site; leaving it as it is. See the ""DC site subnet"" test row."
+            } else {
+                $holdingSite = @(Get-ADReplicationSite -Filter * | Where-Object { [string]$_.DistinguishedName -eq $subnetSiteDN })
+                $holdingSiteName = if ($holdingSite.Count -gt 0) { [string]$holdingSite[0].Name } else { $subnetSiteDN }
+                $result.SubnetHeldBySite = $holdingSiteName
+                Write-LogWarn "Site topology: subnet $targetSubnet already exists in site '$holdingSiteName'; leaving it there, so the DC's site '$($dcSite.Name)' does not get it. See the ""DC site subnet"" test row."
+            }
+        } else {
+            $localSubnet       = $targetSubnet
+            $localSiteName     = [string]$dcSite.Name
+            $localSubnetSearch = "CN=Subnets,CN=Sites,$configurationNC"
+            try {
+                # The operation re-checks first, so a retry after a create that landed
+                # without a reply does not try to create the subnet twice.
+                Invoke-ADWriteWithRetry -OperationName "New-ADReplicationSubnet $localSubnet" -Operation {
+                    $subnetNow = @(Get-ADObject -SearchBase $localSubnetSearch -LDAPFilter '(objectClass=subnet)' | Where-Object { [string]$_.Name -eq $localSubnet })
+                    if ($subnetNow.Count -eq 0) {
+                        $null = New-ADReplicationSubnet -Name $localSubnet -Site $localSiteName
+                    }
+                }
+                Write-LogSuccess "Site topology: created subnet $targetSubnet in site '$($dcSite.Name)'."
+            } catch {
+                Write-LogWarn "Site topology: creating subnet $targetSubnet in site '$($dcSite.Name)' failed: $(Get-BuildProfileSingleLine -Text "$_"). See the ""DC site subnet"" test row."
+            }
+        }
+        #endregion
+    } catch {
+        $result.StepError = Get-BuildProfileSingleLine -Text "$_"
+        Write-LogWarn "Site topology: the step stopped early: $(Get-BuildProfileSingleLine -Text "$_"). See the site test rows."
+    }
+    return $result
+}
+
+function Get-SiteTopologyTestRow {
+    # The five site and subnet test rows, from what Set-ADSiteTopology ended with and a
+    # fresh read of AD. Returns objects with TestName, Passed and Detail. Never throws.
+    param(
+        [Parameter(Mandatory)][pscustomobject]$SiteTopologyParam,
+        [Parameter(Mandatory)][string]$DomainNameParam,
+        [Parameter(Mandatory)][string]$ComputerNameParam,
+        [int]$LocatorRetryCountParam    = 6,
+        [int]$LocatorRetryDelaySecParam = 10
+    )
+    $topology = $SiteTopologyParam
+    $siteCase = $topology.SiteCase
+    $newRow = { param($TestName, $Passed, $Detail) [pscustomobject]@{ TestName = $TestName; Passed = [bool]$Passed; Detail = [string]$Detail } }
+    $siteUnknownDetail = "The DC's site could not be read: $($topology.StepError)"
+
+    # DC site subnet
+    try {
+        if (-not $topology.SiteName) {
+            & $newRow 'DC site subnet' $false $siteUnknownDetail
+        } elseif (-not $topology.DcAddress) {
+            & $newRow 'DC site subnet' $false "The DC's IPv4 address could not be worked out, so no subnet was checked (site case $siteCase)"
+        } else {
+            $siteSubnets = @(Get-ADObject -SearchBase "CN=Subnets,CN=Sites,$($topology.ConfigurationNC)" -LDAPFilter '(objectClass=subnet)' -Properties siteObject |
+                Where-Object { [string]$_.siteObject -eq $topology.SiteDistinguishedName })
+            $coveringSubnet = @($siteSubnets | Where-Object { Test-IPv4AddressInSubnet -IPAddress $topology.DcAddress -Subnet ([string]$_.Name) })
+            if ($coveringSubnet.Count -gt 0) {
+                & $newRow 'DC site subnet' $true "Site '$($topology.SiteName)' holds $($coveringSubnet[0].Name), which contains the DC's address $($topology.DcAddress) (site case $siteCase)"
+            } else {
+                & $newRow 'DC site subnet' $false "Site '$($topology.SiteName)' holds no subnet containing the DC's address $($topology.DcAddress) (site case $siteCase)"
+            }
         }
     } catch {
-        Write-LogError "AD site topology configuration failed: $_"
-        throw
+        & $newRow 'DC site subnet' $false "$_"
+    }
+
+    # Requested subnet
+    if (-not $topology.DcAddress) {
+        & $newRow 'Requested subnet' $true "Requested $($topology.RequestedSubnet); the subnet step was skipped because the DC's address is unknown. See ""DC site subnet"""
+    } elseif ($topology.SubnetFellBackToAuto) {
+        & $newRow 'Requested subnet' $false "Requested $($topology.RequestedSubnet), actual $($topology.Subnet): the requested subnet does not contain the DC's address $($topology.DcAddress)"
+    } else {
+        & $newRow 'Requested subnet' $true "Requested $($topology.RequestedSubnet), actual $($topology.Subnet)"
+    }
+
+    # Primary site name
+    if (-not $topology.SiteName) {
+        & $newRow 'Primary site name' $false $siteUnknownDetail
+    } elseif ($topology.SiteName -eq $topology.RequestedSiteName) {
+        & $newRow 'Primary site name' $true "Requested '$($topology.RequestedSiteName)', actual '$($topology.SiteName)'"
+    } else {
+        & $newRow 'Primary site name' $false "Requested '$($topology.RequestedSiteName)', actual '$($topology.SiteName)' (site case $siteCase)"
+    }
+
+    # Site link membership
+    try {
+        if (-not $topology.SiteName) {
+            & $newRow 'Site link membership' $false $siteUnknownDetail
+        } else {
+            $siteLinks = @(Get-ADObject -SearchBase "CN=IP,CN=Inter-Site Transports,CN=Sites,$($topology.ConfigurationNC)" -LDAPFilter '(objectClass=siteLink)' -Properties siteList |
+                Where-Object { @($_.siteList | ForEach-Object { [string]$_ }) -contains $topology.SiteDistinguishedName })
+            if ($siteLinks.Count -gt 0) {
+                & $newRow 'Site link membership' $true "Site '$($topology.SiteName)' is in IP site link '$($siteLinks[0].Name)'"
+            } else {
+                & $newRow 'Site link membership' $false "No IP site link includes site '$($topology.SiteName)'"
+            }
+        }
+    } catch {
+        & $newRow 'Site link membership' $false "$_"
+    }
+
+    # Site locator record
+    if (-not $topology.SiteName) {
+        & $newRow 'Site locator record' $false $siteUnknownDetail
+    } else {
+        $recordName   = "_ldap._tcp.$($topology.SiteName)._sites.dc._msdcs.$DomainNameParam"
+        $dcHostName   = "$ComputerNameParam.$DomainNameParam"
+        $lastOutcome  = 'no answer'
+        $recordFound  = $false
+        for ($locatorAttempt = 1; $locatorAttempt -le $LocatorRetryCountParam; $locatorAttempt++) {
+            try {
+                # Whether Resolve-DnsName answers from the client cache is not documented,
+                # so the cache is cleared before each try.
+                Clear-DnsClientCache
+                $srvRecords = @(Resolve-DnsName -Name $recordName -Type SRV -DnsOnly -ErrorAction Stop)
+                $targets    = @($srvRecords | Where-Object { $_.PSObject.Properties.Name -contains 'NameTarget' } | ForEach-Object { ([string]$_.NameTarget).TrimEnd('.') })
+                if (@($targets | Where-Object { $_ -eq $dcHostName }).Count -gt 0) {
+                    $recordFound = $true
+                    break
+                }
+                $lastOutcome = "targets: $(if ($targets.Count -gt 0) { $targets -join ', ' } else { 'none' })"
+            } catch {
+                $lastOutcome = "$_"
+            }
+            if ($locatorAttempt -lt $LocatorRetryCountParam) { Start-Sleep -Seconds $LocatorRetryDelaySecParam }
+        }
+        if ($recordFound) {
+            & $newRow 'Site locator record' $true "Resolved $recordName to $dcHostName"
+        } else {
+            & $newRow 'Site locator record' $false "$recordName did not resolve to $dcHostName within $($LocatorRetryCountParam * $LocatorRetryDelaySecParam) seconds: $lastOutcome"
+        }
+    }
+}
+
+function Get-ServiceAccountSpnTestRow {
+    # The "Service account SPNs" row: each CSV row with an SPN must have its account hold
+    # that SPN after {DomainName} substitution. Returns one object with TestName, Passed
+    # and Detail. Never throws.
+    param(
+        [AllowEmptyCollection()][array]$ServiceAccountDefsParam,
+        [Parameter(Mandatory)][string]$DomainNameParam
+    )
+    try {
+        $spnRows    = @($ServiceAccountDefsParam | Where-Object { $_.SPN -and "$($_.SPN)".Trim() -ne '' })
+        $mismatches = [System.Collections.Generic.List[string]]::new()
+        foreach ($spnRow in $spnRows) {
+            $samName     = "svc_$($spnRow.Name)"
+            $expectedSpn = Resolve-ServicePrincipalName -ServicePrincipalName $($spnRow.SPN) -DomainName $DomainNameParam
+            $account     = Get-ADUser -Filter "SamAccountName -eq '$(ConvertTo-AdFilterValue -Value $samName)'" -Properties servicePrincipalName
+            $heldSpns    = @()
+            if ($account) { $heldSpns = @($account.servicePrincipalName | ForEach-Object { [string]$_ }) }
+            if ($heldSpns -notcontains $expectedSpn) {
+                $heldText = if ($heldSpns.Count -gt 0) { $heldSpns -join ', ' } else { 'none' }
+                $mismatches.Add("$samName expected '$expectedSpn', holds '$heldText'")
+            }
+        }
+        if ($mismatches.Count -eq 0) {
+            return [pscustomobject]@{ TestName = 'Service account SPNs'; Passed = $true; Detail = "All $($spnRows.Count) CSV rows with an SPN matched" }
+        }
+        return [pscustomobject]@{ TestName = 'Service account SPNs'; Passed = $false; Detail = "$($mismatches.Count) of $($spnRows.Count) did not match: $($mismatches -join '; ')" }
+    } catch {
+        return [pscustomobject]@{ TestName = 'Service account SPNs'; Passed = $false; Detail = "$_" }
     }
 }
 #endregion
@@ -1252,7 +1640,10 @@ function Invoke-FunctionalTests {
         [string]$DomainNameParam,
         [int]$MinDAParam,
         [int]$ExpectedUserCountParam,
-        [string]$CACommonNameParam
+        [string]$CACommonNameParam,
+        [pscustomobject]$SiteTopologyParam,
+        [array]$ServiceAccountDefsParam,
+        [string]$ComputerNameParam
     )
     $testResults = [System.Collections.Generic.List[object]]::new()
 
@@ -1354,7 +1745,18 @@ function Invoke-FunctionalTests {
         Add-TestResult -TestName 'User Count' -Passed $false -Detail "$_"
     }
 
-    $passCount = ($testResults | Where-Object { $_.Result -eq 'PASS' }).Count
+    # DC site subnet, Requested subnet, Primary site name, Site link membership, Site locator record
+    if ($SiteTopologyParam) {
+        foreach ($siteRow in @(Get-SiteTopologyTestRow -SiteTopologyParam $SiteTopologyParam -DomainNameParam $DomainNameParam -ComputerNameParam $ComputerNameParam)) {
+            Add-TestResult -TestName $siteRow.TestName -Passed $siteRow.Passed -Detail $siteRow.Detail
+        }
+    }
+
+    # Service account SPNs
+    $spnRow = Get-ServiceAccountSpnTestRow -ServiceAccountDefsParam $ServiceAccountDefsParam -DomainNameParam $DomainNameParam
+    Add-TestResult -TestName $spnRow.TestName -Passed $spnRow.Passed -Detail $spnRow.Detail
+
+    $passCount =($testResults | Where-Object { $_.Result -eq 'PASS' }).Count
     $failCount = ($testResults | Where-Object { $_.Result -eq 'FAIL' }).Count
     Write-LogInfo "Functional tests complete: $passCount passed, $failCount failed."
 
@@ -1372,10 +1774,13 @@ function Export-Artifacts {
     try {
         $null = New-Item -ItemType Directory -Path $ArtifactsPathParam -Force
         $timestamp = Get-Date -Format 'yyyyMMddHHmmss'
+        # Windows PowerShell 5.1 writes ASCII by default, which turns every non-ASCII
+        # character in a name into '?'. Both values write UTF-8 with a byte order mark.
+        $csvEncoding = if ($PSVersionTable.PSVersion.Major -ge 6) { 'utf8BOM' } else { 'UTF8' }
 
-        $Users | Export-Csv "$ArtifactsPathParam\users-$timestamp.csv" -NoTypeInformation
+        $Users | Export-Csv "$ArtifactsPathParam\users-$timestamp.csv" -NoTypeInformation -Encoding $csvEncoding
         $Users | ConvertTo-Json | Out-File "$ArtifactsPathParam\users-$timestamp.json" -Encoding utf8
-        $TestResults | Export-Csv "$ArtifactsPathParam\test-results-$timestamp.csv" -NoTypeInformation
+        $TestResults | Export-Csv "$ArtifactsPathParam\test-results-$timestamp.csv" -NoTypeInformation -Encoding $csvEncoding
 
         Write-LogSuccess "Artifacts exported to '$ArtifactsPathParam'."
     } catch {
@@ -1423,6 +1828,17 @@ try {
 
     Write-LogInfo "Initialize-ADDirectory.ps1 started."
 
+    # Build profile results from include\global-config.ps1, logged now that logging has
+    # started. The logon task is still registered, so a fixed profile re-runs at logon.
+    $buildProfileFailed = Write-BuildProfileResult `
+        -SummaryParam  $buildProfileSummary `
+        -InfoParam     $buildProfileInfo `
+        -WarningsParam $buildProfileWarnings `
+        -ErrorParam    $buildProfileError
+    if ($buildProfileFailed) {
+        throw "Stopping: the build profile check failed (error above). Fix it, then log on again to let the logon task re-run population, or run this script again."
+    }
+
     if ($RandomSeed -ne 0) {
         $null = Get-Random -SetSeed $RandomSeed
         Write-LogInfo "Random seed set to $RandomSeed for reproducible run."
@@ -1432,8 +1848,16 @@ try {
     if (-not (Test-DomainPrerequisites -DomainNameParam $domainName -ArtifactsPathParam $artifactsPath)) {
         throw "Pre-flight checks failed. Review errors above before re-running."
     }
-    Remove-PopulateScheduledTask -TaskNameParam $scheduledTaskName
     #endregion
+
+    #region CSV Validation and Load
+    # Before the logon task is removed, so a CSV fix plus a logon re-runs population.
+    # Both only read files.
+    Test-AllCsvFiles  -CsvBasePath  $csvPath -DomainNameParam $domainName
+    Import-LabCsvData -CsvPathParam $csvPath
+    #endregion
+
+    Remove-PopulateScheduledTask -TaskNameParam $scheduledTaskName
 
     #region Service Readiness
     Wait-ForADServices
@@ -1452,11 +1876,6 @@ try {
         -CALogPathParam       $caLogPath
     Set-TimeConfiguration -NtpServersParam $ntpServers
     Test-FirewallRules
-    #endregion
-
-    #region CSV Validation and Load
-    Test-AllCsvFiles  -CsvBasePath  $csvPath
-    Import-LabCsvData -CsvPathParam $csvPath
     #endregion
 
     #region OU Structure
@@ -1533,7 +1952,8 @@ try {
     New-ServiceAccounts `
         -ServiceAccountDefs  $script:serviceAcctDefs `
         -TargetOU            $serviceAccountsOU `
-        -PasswordLengthParam $PasswordLength
+        -PasswordLengthParam $PasswordLength `
+        -DomainNameParam     $domainName
 
     if ($ComputerCount -gt 0) {
         New-ComputerObjects `
@@ -1560,19 +1980,24 @@ try {
         -LockoutThresholdParam   $lockoutThreshold `
         -LockoutDurationMinParam $lockoutDurationMinutes `
         -MaxPwAgeDaysParam       $maxPasswordAgeDays
-    Set-ADSiteTopology `
+    $siteTopology = Set-ADSiteTopology `
         -PrimarySiteNameParam $primarySiteName `
-        -PrimarySubnetParam   $primarySubnet
+        -PrimarySubnetParam   $primarySubnet `
+        -DomainNameParam      $domainName `
+        -ComputerNameParam    $env:COMPUTERNAME
     #endregion
 
     #region Validation and Reporting
     $testResults = Invoke-FunctionalTests `
-        -UsersOUParam           $usersOU `
-        -DisabledUsersOUParam   $disabledUsersOU `
-        -DomainNameParam        $domainName `
-        -MinDAParam             $MinDA `
-        -ExpectedUserCountParam $UserCount `
-        -CACommonNameParam      $caCommonName
+        -UsersOUParam            $usersOU `
+        -DisabledUsersOUParam    $disabledUsersOU `
+        -DomainNameParam         $domainName `
+        -MinDAParam              $MinDA `
+        -ExpectedUserCountParam  $UserCount `
+        -CACommonNameParam       $caCommonName `
+        -SiteTopologyParam       $siteTopology `
+        -ServiceAccountDefsParam $script:serviceAcctDefs `
+        -ComputerNameParam       $env:COMPUTERNAME
     Export-Artifacts -Users $createdUsers -TestResults $testResults -ArtifactsPathParam $artifactsPath
 
     $passCount = ($testResults | Where-Object { $_.Result -eq 'PASS' }).Count

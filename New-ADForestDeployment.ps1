@@ -9,7 +9,15 @@
 
     Domain identity ($domainName, $forestName, $netBIOSName) is read from
     include\global-config.ps1, the single source of truth shared with
-    Initialize-ADDirectory.ps1. Edit global-config.ps1 to deploy a different domain.
+    Initialize-ADDirectory.ps1. To deploy a different domain, place a build profile at
+    include\build-profile.psd1 (for example @{ DomainName = 'corp.example.test';
+    NetBIOSName = 'CORP' }), or edit global-config.ps1. The profile's results are
+    logged after the "started" line, and a profile error stops the run before anything
+    is changed.
+
+    Before promotion, after the AD DS role is installed, the forest and domain
+    functional level names are checked against the names the installed
+    Install-ADDSForest accepts, when its parameter types can be read.
 
     The reboot only occurs if forest promotion succeeds. If pre-flight checks or
     any earlier step fails, the script exits without rebooting.
@@ -23,9 +31,9 @@
     .\New-ADForestDeployment.ps1 -CreateScheduledTask -NonInteractive `
         -StaticIpAddress '192.168.1.50' -PrefixLength 24 -DefaultGateway '192.168.1.1'
 .NOTES
-    Version:      1.0.0
+    Version:      2.0.0
     Author:       Daniel Owen
-    Release Date: 2026-07-13
+    Release Date: 2026-11-05
     Requirements: Windows Server 2025, PowerShell 5.1+, local Administrator
 #>
 
@@ -102,7 +110,7 @@ function Test-Prerequisites {
 
         $os = Get-CimInstance Win32_OperatingSystem
         if ($os.BuildNumber -lt $RequiredOSBuild) {
-            Write-LogError "Requires Windows Server build $RequiredOSBuild or later. Detected build: $($os.BuildNumber). Adjust `$requiredOSBuild in include\global-config.ps1 to target an earlier version (minimum 14393 / Server 2016)."
+            Write-LogError "Requires Windows Server build $RequiredOSBuild or later. Detected build: $($os.BuildNumber). Server 2025 (build 26100) is the only tested release. To run on Server 2019 or 2022, set RequiredOSBuild in a build profile (include\build-profile.psd1) to a build of 17763 or higher, the lab's lowest supported build."
             return $false
         }
 
@@ -271,6 +279,52 @@ function Install-RequiredFeatures {
     }
 }
 
+function Get-FunctionalLevelParameterType {
+    # Reads the type of one of Install-ADDSForest's mode parameters (ForestMode or
+    # DomainMode). Returns the type, or the reason it could not be read. Never throws.
+    param(
+        [Parameter(Mandatory)][string]$ParameterNameParam
+    )
+    try {
+        $installForestCommand = Get-Command -Name Install-ADDSForest -ErrorAction Stop
+        if (-not $installForestCommand.Parameters.ContainsKey($ParameterNameParam)) {
+            throw "Install-ADDSForest has no $ParameterNameParam parameter"
+        }
+        return [pscustomobject]@{ ParameterType = $installForestCommand.Parameters[$ParameterNameParam].ParameterType; ReadError = $null }
+    } catch {
+        return [pscustomobject]@{ ParameterType = $null; ReadError = (($_.Exception.Message -replace '\s*\r?\n\s*', ' ').Trim().TrimEnd('.')) }
+    }
+}
+
+function Test-FunctionalLevelName {
+    # Compares a functional level name with the names the installed Install-ADDSForest
+    # parameter accepts. Returns $false only when the parameter is an enum that does not
+    # hold the name. A type that is not an enum, or one that could not be read, logs a
+    # WARN and leaves the check to Install-ADDSForest itself.
+    param(
+        [Parameter(Mandatory)][string]$ParameterNameParam,
+        [Parameter(Mandatory)][string]$VariableNameParam,
+        [Parameter(Mandatory)][string]$LevelNameParam,
+        [AllowNull()][type]$ParameterTypeParam,
+        [AllowNull()][string]$ReadErrorParam
+    )
+    if ($null -eq $ParameterTypeParam) {
+        Write-LogWarn "Functional level check: couldn't read Install-ADDSForest's $ParameterNameParam parameter: $ReadErrorParam. Leaving the check of '$LevelNameParam' to Install-ADDSForest."
+        return $true
+    }
+    if (-not $ParameterTypeParam.IsEnum) {
+        Write-LogWarn "Functional level check: Install-ADDSForest's $ParameterNameParam parameter is of type $($ParameterTypeParam.FullName), not an enum, so its accepted names can't be read here. Leaving the check of '$LevelNameParam' to Install-ADDSForest."
+        return $true
+    }
+    $acceptedNames = @([Enum]::GetNames($ParameterTypeParam))
+    if ($acceptedNames -contains $LevelNameParam) {
+        Write-LogInfo "Functional level check: Install-ADDSForest accepts $ParameterNameParam '$LevelNameParam'."
+        return $true
+    }
+    Write-LogError "Functional level check: Install-ADDSForest on this server does not accept $ParameterNameParam '$LevelNameParam'. It accepts: $($acceptedNames -join ', '). Set $ParameterNameParam in the build profile, or `$$VariableNameParam in global-config.ps1, to a level this server accepts. The AD DS role is already installed and this script's pre-flight refuses a server that has it, so start again from a clean server."
+    return $false
+}
+
 function Install-NewForest {
     param(
         [string]$DomainNameParam,
@@ -376,6 +430,16 @@ try {
 
     Write-LogInfo "New-ADForestDeployment.ps1 started."
 
+    # Build profile results from include\global-config.ps1, logged now that logging has started.
+    $buildProfileFailed = Write-BuildProfileResult `
+        -SummaryParam  $buildProfileSummary `
+        -InfoParam     $buildProfileInfo `
+        -WarningsParam $buildProfileWarnings `
+        -ErrorParam    $buildProfileError
+    if ($buildProfileFailed) {
+        throw "Stopping before any change: the build profile check failed (error above). Fix it and run this script again."
+    }
+
     if ($forestName -ne $domainName) {
         throw "For a new forest root domain, `$forestName must equal `$domainName in global-config.ps1. Found: domainName='$domainName', forestName='$forestName'."
     }
@@ -391,6 +455,24 @@ try {
         -DefaultGateway  $DefaultGateway `
         -AdapterName     $AdapterName
     Install-RequiredFeatures
+
+    # The Install-ADDSForest reference lists mode values only up to WinThreshold, so the
+    # names are checked against the installed cmdlet before promoting.
+    foreach ($levelCheck in @(
+            @{ ParameterName = 'ForestMode'; VariableName = 'forestMode'; LevelName = $forestMode },
+            @{ ParameterName = 'DomainMode'; VariableName = 'domainMode'; LevelName = $domainMode })) {
+        $levelTypeRead = Get-FunctionalLevelParameterType -ParameterNameParam $levelCheck.ParameterName
+        $levelAccepted = Test-FunctionalLevelName `
+            -ParameterNameParam $levelCheck.ParameterName `
+            -VariableNameParam  $levelCheck.VariableName `
+            -LevelNameParam     $levelCheck.LevelName `
+            -ParameterTypeParam $levelTypeRead.ParameterType `
+            -ReadErrorParam     $levelTypeRead.ReadError
+        if (-not $levelAccepted) {
+            throw "Functional level check failed for $($levelCheck.ParameterName) '$($levelCheck.LevelName)'. Review the error above."
+        }
+    }
+
     Install-NewForest `
         -DomainNameParam   $domainName `
         -ForestNameParam   $forestName `
