@@ -17,13 +17,29 @@ Two scripts run in sequence, split by the promotion reboot. Everything that has 
 
 Script two does not run on its own. The scheduled task uses an **at-logon** trigger, so directory population starts the next time an Administrator logs into the DC after the reboot. Script one prints a red banner reminding you of exactly that. If you skip `-CreateScheduledTask`, you will need to run script two by hand after the reboot.
 
-Domain identity (`lab.test` / `LAB` out of the box) lives in one place, [include/global-config.ps1](include/global-config.ps1). Both scripts read it. To build a different domain without editing that file, drop in a build profile, covered in the Build Profiles section below. More configuration notes are found in the Configuration Notes section of this document.
+Domain identity (`lab.test` / `LAB` out of the box), the password policy, the CA, the population mix and the rest are settings with shipped defaults. Every setting you can change without editing a script, and how, is in [OVERRIDE.md](OVERRIDE.md). To build a different domain for one build only, drop in a build profile, covered in the Build Profiles section below.
+
+## What's New in 2.1
+
+2.1 is about upgrades. Until now every setting lived in a tracked file, so an upgrade meant carrying your edits across by hand, and a `git pull` fought with them.
+
+- **An override file.** Your settings go in one file that git ignores and no upgrade touches. Script one and script two both read it, a build profile still wins over it for one build, and a value you pass on the command line wins over both. [OVERRIDE.md](OVERRIDE.md) lists every setting, its default, what it takes and why it ships that way.
+- **Your own CSV files** go next to it and replace the shipped file of the same name, so an edited `serviceaccounts.csv` survives the next upgrade too.
+- **`Export-OverrideFile.ps1`** reads an older copy of this project, never runs it, and writes the settings you changed into the override file. [UPGRADE.md](UPGRADE.md) walks through it.
+- **A version check.** Both scripts log their version, and stop before any change when `include\global-config.ps1` is older than the release they need. Before, nothing caught an old global-config.ps1 copied over a new one.
+- **A clash gives way instead of stopping.** If the user-state percentages you set push the total past 100, the shipped ones you left alone are lowered with a warning. A `MinDA` above the shipped `MaxDA` raises it. Only your own values clashing with each other stop the run, and they stop it before anything is created.
+- **SPNs that name another domain get a warning.** A literal SPN such as `MSSQLSvc/sql01.lab.local:1433` in a `lab.test` build is written as given, with a warning that shows the `{DomainName}` form.
+- **Generated passwords hold both letter cases.** The check for an upper-case and a lower-case letter ignored case, so a password could have only one. Now both are required.
+- **The minimum password length ships as 14, down from 15.** A domain's password policy holds at most 14 unless "Relax minimum password length limits" is turned on, and in a test build the DC logged event 16979 and enforced 14 anyway. A value from 15 to 128 still builds, with 14 and a warning. Anything above 128 stops the run before any change.
+- **A changed default gets named.** When a release changes a shipped default and your run leaves that setting alone, both scripts log one INFO line with the old value, the new one and the override key that keeps the old one. In 2.1 that's the password length.
+- **More than one NTP server.** Script two joined the `NtpServers` list with commas for `w32tm`. Microsoft's "Windows Time Service Tools and Settings" page says the peer list is space-delimited, so the peers are joined with spaces now. The shipped list has one server, so only an edited list was affected.
+- **A CSV with a single row works.** Script two read each CSV file without making it a list, and on Windows PowerShell 5.1 a file with one row comes back as a single item with no row count. A replacement `offices.csv` holding one office stopped the run with "TOO FEW ROWS in offices.csv: found , need 1", and a `companies.csv` with one company would have stopped it later, after the CA, the OUs and the groups were created. Every CSV is read as a list now, so one row counts as one. The bug goes back to 1.0.
 
 ## What's Changed Since 1.0
 
 1.0 built one forest, `lab.local`, unless you edited [include/global-config.ps1](include/global-config.ps1) by hand. 2.0 still builds the same lived-in domain in the same two steps. What changed is which forest you get, where the DC ends up in AD Sites and Services, and how loudly the scripts tell you a setting is wrong.
 
-**Thinking of upgrading?** 2.0 is a feature release, not a bug fix. If you don't need anything below, you may do better waiting for the next version. That one is planned to keep every setting you might change in an override file that upgrades leave alone, with a small script that moves your current edits into it. If you do upgrade now, [UPGRADE.md](UPGRADE.md) has the steps.
+**Coming from 1.0 or 2.0?** [UPGRADE.md](UPGRADE.md) has the steps. From 2.1 on, your settings live in a file that upgrades leave alone, so this is the last upgrade that needs them moved.
 
 ### New in 2.0
 
@@ -48,7 +64,7 @@ Domain identity (`lab.test` / `LAB` out of the box) lives in one place, [include
 
 ## Screenshots
 
-### Script one -- `New-ADForestDeployment.ps1`
+### Script one - `New-ADForestDeployment.ps1`
 
 1. **Feature installation.** Installing AD DS, DNS, and management tools before promotion.
 
@@ -62,7 +78,7 @@ Domain identity (`lab.test` / `LAB` out of the box) lives in one place, [include
 
 ![Console output showing forest installation starting, with an expected DNS delegation warning](images/s1_3.jpg)
 
-### Script two -- `Initialize-ADDirectory.ps1`
+### Script two - `Initialize-ADDirectory.ps1`
 
 4. **Post-promotion pre-flight.** Confirms core AD services are running, saves the dcdiag/repadmin reports, and enables the Recycle Bin.
 
@@ -134,7 +150,13 @@ git clone https://github.com/0x44616e69656c/new-AdDomain.git
 cd new-AdDomain
 ```
 
-If you want something other than `lab.test` / `LAB`, add a build profile (see Build Profiles) or edit [include/global-config.ps1](include/global-config.ps1). Then run script one from an elevated prompt on a clean Server 2025 box:
+Downloaded the zip instead? Windows blocks files downloaded from the internet by default, and a `RemoteSigned` execution policy won't run a blocked script. Look the files over, then unblock them from inside the extracted folder:
+
+```powershell
+Get-ChildItem -Recurse -File | Unblock-File
+```
+
+If you want something other than `lab.test` / `LAB`, set `DomainName` and `NetBIOSName` in the override file ([OVERRIDE.md](OVERRIDE.md) shows how) or add a build profile (see Build Profiles). Then run script one from an elevated prompt on a clean Server 2025 box:
 
 ```powershell
 .\New-ADForestDeployment.ps1 -CreateScheduledTask
@@ -180,6 +202,8 @@ A smaller, reproducible population with computer objects included:
 
 ### `Initialize-ADDirectory.ps1`
 
+Each default below can also be changed in the override file, and a value you pass on the command line wins over it. [OVERRIDE.md](OVERRIDE.md) has the keys.
+
 | Parameter | Default | Notes |
 |---|---|---|
 | `-UserCount` | `1000` | Number of users to create. |
@@ -193,11 +217,11 @@ A smaller, reproducible population with computer objects included:
 | `-MaxGroupNestingDepth` | `3` | Deepest group-in-group nesting. |
 | `-RandomSeed` | `0` | Seeds the RNG for a reproducible run. `0` means no seed (fresh randomness each run). |
 
-Domain name, NetBIOS name, OU layout, CA settings, password policy, and the user-state percentages are configuration, not parameters. They live in [include/global-config.ps1](include/global-config.ps1). A build profile can override the domain, the functional levels, the minimum build and the site for one build.
+Domain name, NetBIOS name, CA settings, password policy, the user-state percentages and the rest are configuration, not parameters. [OVERRIDE.md](OVERRIDE.md) lists each one and how to change it. A build profile can override the domain, the functional levels, the minimum build and the site for one build.
 
 ## Build Profiles
 
-A build profile lets you build a different forest without touching [include/global-config.ps1](include/global-config.ps1). It is a PowerShell data file at `include\build-profile.psd1`. Both scripts read it when it is there, and anything it leaves out takes the global-config.ps1 value. The file name is in `.gitignore`, so a profile you drop in for one build never gets committed by accident.
+A build profile picks the forest for one build, without touching your standing settings. It is a PowerShell data file at `include\build-profile.psd1`. Both scripts read it when it is there, and it wins over the override file for the keys it sets. The file name is in `.gitignore`, so a profile you drop in for one build never gets committed by accident.
 
 ```powershell
 @{
@@ -208,21 +232,7 @@ A build profile lets you build a different forest without touching [include/glob
 }
 ```
 
-Each key overrides the global-config.ps1 variable of the same name, with a capital first letter.
-
-| Key | Overrides | Valid values |
-|---|---|---|
-| `DomainName` | `$domainName` | Two or more labels of letters, digits and hyphens, 64 characters at most. `$forestName` follows it. |
-| `NetBIOSName` | `$netBIOSName` | 1 to 15 letters, digits or hyphens, not digits only, not a reserved word. Leave it out and the first label of `DomainName`, upper-cased, is used with a warning. |
-| `ForestMode` | `$forestMode` | `WinThreshold` or `Win2025` |
-| `DomainMode` | `$domainMode` | `WinThreshold` or `Win2025`, never lower than `ForestMode` |
-| `RequiredOSBuild` | `$requiredOSBuild` | 17763 or higher |
-| `PrimarySiteName` | `$primarySiteName` | 1 to 63 letters, digits or hyphens |
-| `PrimarySubnet` | `$primarySubnet` | `Auto`, or an IPv4 subnet such as `192.168.159.0/24` |
-
-The rule is that a forgotten or recycled setting never fails a build. A key you leave out takes the global-config.ps1 value and gets one INFO line. An empty value takes the same fallback with a warning. So does a value that clashes, such as a minimum build too low for `Win2025`, which gets raised. The run stops only for a typo or for something the build cannot do, like an unknown key or a level other than `WinThreshold` and `Win2025`. Every line names where the value came from, the profile or global-config.ps1, so you know which file to fix. The same checks apply to global-config.ps1 itself.
-
-Keys for features that do not exist yet (`RandomSeed`, `Machines`, `Trusts` and a few others) are refused rather than quietly ignored. A profile should never look like it did something the build did not.
+The keys a profile takes, what each accepts, what happens to a key you leave out or leave empty, and the keys it refuses are in the [Build profile](OVERRIDE.md#build-profile) part of OVERRIDE.md. Every log line names where its value came from, so you know which file to fix. If build-lab drives your builds, its `-ProfilePath` parameter picks the profile for a run, and build-lab's own README covers it.
 
 ### Service account SPNs
 
@@ -248,13 +258,15 @@ Logs go to `logs\` under the project folder.
 
 Both scripts produce:
 
-- `<ScriptName>-<timestamp>.log` -- the full PowerShell transcript for after-the-fact diagnosis.
-- `ad-deploy-errors.csv` -- structured `WARN`/`ERROR` rows shared by both scripts, so failures survive across runs and can be queried without grepping transcripts. Columns: `Timestamp,Level,Script,Message`. Import with `Import-Csv`.
+- `<ScriptName>-<timestamp>.log` - the full PowerShell transcript for after-the-fact diagnosis.
+- `ad-deploy-errors.csv` - structured `WARN`/`ERROR` rows shared by both scripts, so failures survive across runs and can be queried without grepping transcripts. Columns: `Timestamp,Level,Script,Message`. Import with `Import-Csv`.
 
 Script two also writes two post-promotion diagnostic reports:
 
-- `dcdiag-<timestamp>.txt` -- output of `dcdiag /v`.
-- `repadmin-<timestamp>.txt` -- output of `repadmin /replsummary`.
+- `dcdiag-<timestamp>.txt` - output of `dcdiag /v`.
+- `repadmin-<timestamp>.txt` - output of `repadmin /replsummary`.
+
+`Export-OverrideFile.ps1` writes `Export-OverrideFile_<timestamp>.csv` there too, one row per setting it read, with secret values shown as `<set>`.
 
 If you file a bug, include these.
 
@@ -262,41 +274,44 @@ If you file a bug, include these.
 
 Script two writes a snapshot of what it built to `artifacts\`:
 
-- `users-<timestamp>.csv` and `users-<timestamp>.json` -- every user created, with a subset of attributes. **This includes passwords for users.**
-- `test-results-<timestamp>.csv` -- pass/fail rows from the functional test pass.
+- `users-<timestamp>.csv` and `users-<timestamp>.json` - every user created, with a subset of attributes. **This includes passwords for users.**
+- `test-results-<timestamp>.csv` - pass/fail rows from the functional test pass.
 
 Both CSV files are written as UTF-8 with a byte order mark, so accented names come through intact.
 
 ## Configuration Notes
 
-Configuration defaults are found in [include/global-config.ps1](include/global-config.ps1).
-Text configuration files (names, departments, etc.) are found in the [config](config) directory.
+Every setting, its default and how to change it is in [OVERRIDE.md](OVERRIDE.md). The text files the users, groups and service accounts are built from (names, departments and so on) are in the [config](config) directory, and OVERRIDE.md says how to replace one with your own.
 
 A few choices in [include/global-config.ps1](include/global-config.ps1) are deliberate. Do not "fix" them unless you understand what you are doing and don't report bugs if changes break things:
 
 - **`$usersOU` is `OU=Employees`, not `OU=Users`.** An OU named `Users` collides with the built-in `CN=Users` container at the domain root.
 - **`$forestName` always equals `$domainName`.** This builds a new forest root domain, so the two are the same, and the config sets one from the other.
-- **The DSRM password is hardcoded in script one.** It is a lab tool. The variable is named `$dsrmPwDontDoThisInProd` so nobody mistakes the intent. Technically I guess you can change this one, but it's a lab.
+- **The DSRM password is hardcoded in script one.** It is a lab tool. The variable is named `$dsrmPwDontDoThisInProd` so nobody mistakes the intent. You can change it with the `DsrmPassword` setting in the override file, but it's a lab.
 - **Enterprise CA database and log share one directory.** Fine for a lab, not what you would do in production.
 
 ## Known Limitations
 
-- **Lab and demo only.** Hardcoded DSRM credential, a self-signed-style Enterprise CA, and a wide-open functional model. This is not a hardened build and is not meant to be.
+- **Lab and demo only.** Hardcoded DSRM credential, a self-signed-style Enterprise CA, and a wide-open functional model. This is not a hardened build and is not meant to be. A DSRM password you put in the override file sits there in plain text, and when build-lab drives the build it copies the whole project folder, override file included, onto the DC, where it stays at `C:\temp\new-AdDomain` after the build.
 - **New forest root only.** It does not join an existing forest, add a child domain, or add a replica DC.
 - **Single DC, single site.** The DC's site is renamed and given one subnet. No replication topology beyond that.
 - **Population is only partly idempotent.** OUs, service accounts, computer objects, and GPOs are skipped if they already exist, and the site step keeps whatever site the DC already sits in, but re-running script two adds a fresh batch of randomly generated users and groups and re-rolls their memberships. Start from a clean promotion for a predictable result.
 
 ## Troubleshooting
 
-**"ADCS-Cert-Authority is already installed."** -- `Install-ADDSForest` will not promote a server with the CA role present. Remove AD CS, then re-run script one. The CA is installed later by script two.
+**"ADCS-Cert-Authority is already installed."** - `Install-ADDSForest` will not promote a server with the CA role present. Remove AD CS, then re-run script one. The CA is installed later by script two.
 
-**"DNS name '...' already resolves."** -- The target domain name already answers in DNS, which usually means a conflicting zone or a prior half-built attempt. Clear it before re-running.
+**"DNS name '...' already resolves."** - The target domain name already answers in DNS, which usually means a conflicting zone or a prior half-built attempt. Clear it before re-running.
 
-**Directory never populated after the reboot.** -- The scheduled task triggers at Administrator logon, not at boot. Log into the DC as Administrator. If you never passed `-CreateScheduledTask`, run `Initialize-ADDirectory.ps1` by hand.
+**Directory never populated after the reboot.** - The scheduled task triggers at Administrator logon, not at boot. Log into the DC as Administrator. If you never passed `-CreateScheduledTask`, run `Initialize-ADDirectory.ps1` by hand.
 
-**Script one hangs with no output on an unattended VM.** -- A prompt is waiting on a console that is not there. Re-run with `-NonInteractive` and supply `-StaticIpAddress`, `-PrefixLength`, `-DefaultGateway`, and `-AdapterName` as needed.
+**Script one hangs with no output on an unattended VM.** - A prompt is waiting on a console that is not there. Re-run with `-NonInteractive` and supply `-StaticIpAddress`, `-PrefixLength`, `-DefaultGateway`, and `-AdapterName` as needed.
 
-**"Stopping before any change: the build profile check failed."** -- The ERROR lines just above it name the file (the build profile or global-config.ps1) and the key or variable at fault. Fix that value and run the script again.
+**"Stopping before any change: the build profile check failed."** - The ERROR lines just above it name the file (the override file, the build profile or global-config.ps1) and the key or variable at fault. Fix that value and run the script again.
+
+**"... needs include\global-config.ps1 ... or later, and the one loaded has no version"** - An `include\global-config.ps1` from an older release was put back over this one. Restore this release's copy, and move your settings into the override file as [UPGRADE.md](UPGRADE.md) shows.
+
+**"Override file '...': unknown key"** - A key in your override file is misspelled, or belongs to another lab project, which the line names. [OVERRIDE.md](OVERRIDE.md) lists the keys.
 
 ## Contact
 

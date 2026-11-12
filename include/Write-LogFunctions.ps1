@@ -16,6 +16,11 @@
       - Write-BuildProfileResult : logs the build profile results global-config.ps1
                               set (summary, INFO lines, WARN lines, then each error
                               line) and returns $true when there was an error.
+      - Test-GlobalConfigVersion : checks the loaded global-config.ps1 is at least the
+                              release a script needs, and logs an ERROR when it isn't.
+      - Write-OverrideChangedDefault : logs one INFO line per setting whose shipped
+                              default changed since the previous release, when this
+                              run left it at that default.
 
     Write-CsvLogEntry is an internal helper and should not be called directly by
     consuming scripts. The CSV is written as UTF-8 with a byte order mark on both
@@ -25,9 +30,9 @@
     Initialize-Logging -LogPathParam $logPath -ScriptNameParam "New-ADForestDeployment.ps1" -CsvLogPathParam $csvErrorLogPath
     Write-LogInfo "Starting deployment."
 .NOTES
-    Version:      2.0.0
+    Version:      2.1.0
     Author:       Daniel Owen
-    Release Date: 2026-11-05
+    Release Date: 2026-11-12
     Requirements: PowerShell 5.1+
 #>
 
@@ -139,5 +144,90 @@ function Write-BuildProfileResult {
         return $true
     }
     return $false
+}
+#endregion
+
+#region Global Config Version
+function Test-GlobalConfigVersion {
+    <#
+    .SYNOPSIS
+        Checks that the loaded global-config.ps1 is at least the release a script needs.
+    .DESCRIPTION
+        An older global-config.ps1 put back over this release's has no
+        $globalConfigVersion, or a lower one, and would run this release's scripts
+        without the override file. Versions compare as [version], so a newer
+        global-config.ps1, as between releases, passes. Logs one ERROR naming both
+        versions and returns $false when the check fails, and returns $true otherwise.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$FoundVersionParam,
+        [Parameter(Mandatory)][string]$RequiredVersionParam,
+        [Parameter(Mandatory)][string]$ScriptNameParam
+    )
+    $foundVersion = $null
+    if ($FoundVersionParam) { $foundVersion = $FoundVersionParam -as [version] }
+    if ($null -ne $foundVersion -and $foundVersion -ge [version]$RequiredVersionParam) { return $true }
+    $foundText = if (-not $FoundVersionParam) {
+        'has no version, so it comes from an older release'
+    } elseif ($null -eq $foundVersion) {
+        "has the version '$FoundVersionParam', which isn't a version number"
+    } else {
+        "is version $foundVersion"
+    }
+    Write-LogError "$ScriptNameParam needs include\global-config.ps1 $RequiredVersionParam or later, and the one loaded $foundText. An older copy was probably put back over this release's. Restore this release's include\global-config.ps1 and keep your settings in overrides\overrides.psd1. UPGRADE.md shows how to move them there with Export-OverrideFile.ps1."
+    return $false
+}
+#endregion
+
+#region Changed Defaults
+function Write-OverrideChangedDefault {
+    <#
+    .SYNOPSIS
+        Logs one INFO line for each setting whose shipped default changed since the
+        previous release, when this run left that setting at its shipped default.
+    .DESCRIPTION
+        Reads the override catalog and the release table and hands them to
+        Get-OverrideChangedDefault, from include\OverrideFile.ps1, which global-config.ps1
+        loads. Each line names the setting, its old and new default, and the override
+        key that keeps the old one. A key this run set, from the command line, the build
+        profile or the override file, gets no line. A problem reading either file, or an
+        error from the comparison, is logged as a WARN and never stops the run. Logs
+        nothing when the reader isn't loaded, which global-config.ps1 has already
+        reported.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$CatalogPathParam,
+        [AllowNull()][AllowEmptyString()][string]$ReleaseTablePathParam,
+        [AllowNull()][AllowEmptyString()][string]$CurrentVersionParam,
+        [AllowNull()][AllowEmptyCollection()][string[]]$SetKeyParam,
+        [AllowNull()][AllowEmptyCollection()][string[]]$BoundParameterNameParam
+    )
+    if (-not $CatalogPathParam -or -not (Get-Command -Name 'Get-OverrideChangedDefault' -CommandType Function -ErrorAction SilentlyContinue)) { return }
+    try {
+        $catalogData = Import-PowerShellDataFile -LiteralPath $CatalogPathParam -ErrorAction Stop
+        $releaseData = $null
+        if ($ReleaseTablePathParam -and (Test-Path -LiteralPath $ReleaseTablePathParam -PathType Leaf)) {
+            $releaseData = Import-PowerShellDataFile -LiteralPath $ReleaseTablePathParam -ErrorAction Stop
+        }
+    } catch {
+        Write-LogWarn "Changed default: the override catalog or the release table couldn't be read ($($_.Exception.GetType().FullName)), so changed defaults aren't reported for this run."
+        return
+    }
+    # A parameter given on the command line is set too. Its key is the catalog key whose
+    # Name is that parameter.
+    $setKeys = [System.Collections.Generic.List[string]]::new()
+    foreach ($setKey in @($SetKeyParam)) { if ($setKey) { $setKeys.Add($setKey) } }
+    if ($catalogData -is [hashtable] -and $catalogData['Settings'] -is [hashtable]) {
+        foreach ($catalogKey in @($catalogData['Settings'].get_Keys())) {
+            $catalogEntry = $catalogData['Settings'][$catalogKey]
+            if ($catalogEntry -is [hashtable] -and $catalogEntry['Target'] -ceq 'Parameter' -and @($BoundParameterNameParam) -contains $catalogEntry['Name']) { $setKeys.Add([string]$catalogKey) }
+        }
+    }
+    $changedResult = Get-OverrideChangedDefault -Catalog $catalogData -ReleaseTable $releaseData -CurrentVersion $CurrentVersionParam -SetKey ([string[]]$setKeys.ToArray())
+    foreach ($changedLine in @($changedResult.Info)) { if ($changedLine) { Write-LogInfo $changedLine } }
+    foreach ($changedLine in @($changedResult.Warnings)) { if ($changedLine) { Write-LogWarn $changedLine } }
+    if ($changedResult.Error) {
+        foreach ($changedLine in ($changedResult.Error -split '\r?\n')) { if ($changedLine) { Write-LogWarn $changedLine } }
+    }
 }
 #endregion

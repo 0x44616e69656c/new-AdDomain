@@ -1,12 +1,13 @@
-/junk
-/logs
-/artifacts
-/tests
+# What your runs create in this folder. None of it belongs in a commit.
+
+# Your override file and replacement CSVs. The override file can hold the DSRM password in plain text.
+/overrides/
+
+# A build profile for one build.
 include/build-profile.psd1
-.gitignore-publish
-journal.md
-gotchas.md
-updates.md
-changes.md
-AD_Deployment_Consolidated_Plan.md
-todo.md
+
+# Transcripts, run logs, and the dcdiag and repadmin reports.
+/logs
+
+# The users-<timestamp> files hold every generated password.
+/artifacts

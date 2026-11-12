@@ -7,7 +7,7 @@
     optionally registers a scheduled task to auto-run Initialize-ADDirectory.ps1
     after the promotion reboot, and initiates the reboot.
 
-    Domain identity ($domainName, $forestName, $netBIOSName) is read from
+    Domain identity ($domainName, $netBIOSName) is read from
     include\global-config.ps1, the single source of truth shared with
     Initialize-ADDirectory.ps1. To deploy a different domain, place a build profile at
     include\build-profile.psd1 (for example @{ DomainName = 'corp.example.test';
@@ -19,10 +19,33 @@
     functional level names are checked against the names the installed
     Install-ADDSForest accepts, when its parameter types can be read.
 
+    Settings you keep from build to build go in overrides\overrides.psd1, which
+    global-config.ps1 reads. OVERRIDE.md lists them. Its DsrmPassword key replaces the
+    lab DSRM password set in this script. The script logs its version in the "started"
+    line and stops before any change when include\global-config.ps1 is older than the
+    release it needs.
+
     The reboot only occurs if forest promotion succeeds. If pre-flight checks or
     any earlier step fails, the script exits without rebooting.
 
     Run as: Local Administrator (pre-domain).
+.PARAMETER CreateScheduledTask
+    Registers the at-logon task so script two, Initialize-ADDirectory.ps1, runs by
+    itself the next time an Administrator logs on after the reboot.
+.PARAMETER NonInteractive
+    Never prompts. Any code path that would call Read-Host throws a clear error
+    instead. For console-less unattended runs.
+.PARAMETER StaticIpAddress
+    The static IP to apply when the selected adapter is found on DHCP. Required with
+    -NonInteractive in that case.
+.PARAMETER PrefixLength
+    The subnet prefix length, 1 to 32. Required with -StaticIpAddress under
+    -NonInteractive.
+.PARAMETER DefaultGateway
+    The default gateway. Required with -StaticIpAddress under -NonInteractive.
+.PARAMETER AdapterName
+    Selects the wired NIC by name when more than one eligible adapter is present.
+    Required under -NonInteractive when the choice is ambiguous.
 .EXAMPLE
     .\New-ADForestDeployment.ps1
     .\New-ADForestDeployment.ps1 -CreateScheduledTask
@@ -31,13 +54,15 @@
     .\New-ADForestDeployment.ps1 -CreateScheduledTask -NonInteractive `
         -StaticIpAddress '192.168.1.50' -PrefixLength 24 -DefaultGateway '192.168.1.1'
 .NOTES
-    Version:      2.0.0
+    Version:      2.1.0
     Author:       Daniel Owen
-    Release Date: 2026-11-05
+    Release Date: 2026-11-12
     Requirements: Windows Server 2025, PowerShell 5.1+, local Administrator
 #>
 
 #region Parameters
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+    Justification = 'The DSRM password is a lab constant or the override file value, held as plain text, and Install-ADDSForest takes it as a SecureString built from that text.')]
 param(
     [switch]$CreateScheduledTask,
 
@@ -81,8 +106,20 @@ if (-not (Test-Path $logFuncsPath)) {
 #endregion
 
 #region Script-Local Configuration
+# Equal to the Version line above. The "started" line logs it.
+$scriptVersion               = '2.1.0'
+# The oldest include\global-config.ps1 this script runs with: the first with the
+# override file.
+$requiredGlobalConfigVersion = '2.1.0'
+
 # WARNING: Lab environment only. Never use hardcoded credentials in production.
 $dsrmPwDontDoThisInProd  = "TestEnvAdminP@ss1!"
+# The override file's DsrmPassword, which global-config.ps1 read, replaces it. Neither is
+# ever logged.
+$dsrmPassword            = $dsrmPwDontDoThisInProd
+if ($overrideFileValues -is [hashtable] -and $overrideFileValues.ContainsKey('DsrmPassword')) {
+    $dsrmPassword        = [string]$overrideFileValues['DsrmPassword']
+}
 
 $requiredPSVersion       = [version]"5.1"
 # $requiredOSBuild is defined in include\global-config.ps1 (shared minimum OS build).
@@ -328,7 +365,6 @@ function Test-FunctionalLevelName {
 function Install-NewForest {
     param(
         [string]$DomainNameParam,
-        [string]$ForestNameParam,
         [string]$NetBIOSNameParam,
         [SecureString]$DSRMPasswordParam,
         [string]$ForestModeParam,
@@ -336,7 +372,7 @@ function Install-NewForest {
     )
     try {
         Import-Module ADDSDeployment -ErrorAction Stop
-        Write-LogInfo "Promoting server as forest root DC for '$ForestNameParam'..."
+        Write-LogInfo "Promoting server as forest root DC for '$DomainNameParam'..."
 
         # -NoRebootOnCompletion defers reboot so the finally block can optionally register the scheduled task first.
         # -Force suppresses the interactive confirmation dialog for unattended runs.
@@ -428,9 +464,13 @@ try {
         -CsvLogPathParam $csvErrorLogPath
     Start-Transcript -Path $transcriptPath
 
-    Write-LogInfo "New-ADForestDeployment.ps1 started."
+    Write-LogInfo "New-ADForestDeployment.ps1 $scriptVersion started."
 
-    # Build profile results from include\global-config.ps1, logged now that logging has started.
+    if (-not (Test-GlobalConfigVersion -FoundVersionParam $globalConfigVersion -RequiredVersionParam $requiredGlobalConfigVersion -ScriptNameParam 'New-ADForestDeployment.ps1')) {
+        throw "Stopping before any change: include\global-config.ps1 is older than this script needs (error above)."
+    }
+
+    # Override file and build profile results from include\global-config.ps1, logged now that logging has started.
     $buildProfileFailed = Write-BuildProfileResult `
         -SummaryParam  $buildProfileSummary `
         -InfoParam     $buildProfileInfo `
@@ -440,9 +480,17 @@ try {
         throw "Stopping before any change: the build profile check failed (error above). Fix it and run this script again."
     }
 
-    if ($forestName -ne $domainName) {
-        throw "For a new forest root domain, `$forestName must equal `$domainName in global-config.ps1. Found: domainName='$domainName', forestName='$forestName'."
+    # Script two's count pairs, as the override file sets them. Script two warns about a
+    # pair that gives way. Only a clash of two values the user set stops here, before the
+    # promotion, since the logon task gives script two no command line to fix it.
+    if ($overrideFilePairError) {
+        foreach ($pairErrorLine in ($overrideFilePairError -split '\r?\n')) { if ($pairErrorLine) { Write-LogError $pairErrorLine } }
+        throw "Stopping before any change: the override file's settings for Initialize-ADDirectory.ps1 clash (error above). Fix them and run this script again."
     }
+
+    # One INFO line per shipped default that changed since the previous release, for a
+    # setting this run left at that default.
+    Write-OverrideChangedDefault -CatalogPathParam $overrideFileCatalogPath -ReleaseTablePathParam $overrideFileReleaseTablePath -CurrentVersionParam $scriptVersion -SetKeyParam $overrideFileSetKeys
 
     if (-not (Test-Prerequisites -DomainNameParam $domainName -RequiredOSBuild $requiredOSBuild -RequiredPS $requiredPSVersion)) {
         throw "Pre-flight checks failed. Review errors above before re-running."
@@ -475,9 +523,8 @@ try {
 
     Install-NewForest `
         -DomainNameParam   $domainName `
-        -ForestNameParam   $forestName `
         -NetBIOSNameParam  $netBIOSName `
-        -DSRMPasswordParam (ConvertTo-SecureString $dsrmPwDontDoThisInProd -AsPlainText -Force) `
+        -DSRMPasswordParam (ConvertTo-SecureString $dsrmPassword -AsPlainText -Force) `
         -ForestModeParam   $forestMode `
         -DomainModeParam   $domainMode
 

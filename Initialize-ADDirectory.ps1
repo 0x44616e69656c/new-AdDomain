@@ -25,14 +25,61 @@
     so it does not re-run at subsequent logons. The CSV files are validated first, so
     a CSV fix plus a logon re-runs population.
 
+    Settings you keep from build to build go in overrides\overrides.psd1, which
+    global-config.ps1 reads. OVERRIDE.md lists them. A file under overrides\config
+    replaces the shipped CSV of the same name. The script logs its version in the
+    "started" line and stops before any change when include\global-config.ps1 is older
+    than the release it needs.
+
     Run as: Domain Administrator (post-promotion).
+.PARAMETER UserCount
+    The number of users to create.
+    The default can also be set in overrides\overrides.psd1, key UserCount. A value given
+    here wins over it.
+.PARAMETER GroupCount
+    The number of groups to create before nesting.
+    The default can also be set in overrides\overrides.psd1, key GroupCount. A value given
+    here wins over it.
+.PARAMETER ComputerCount
+    The number of computer objects to create. 0 skips computer creation.
+    The default can also be set in overrides\overrides.psd1, key ComputerCount. A value given
+    here wins over it.
+.PARAMETER PasswordLength
+    The length of each generated password, 4 to 94.
+    The default can also be set in overrides\overrides.psd1, key PasswordLength. A value given
+    here wins over it.
+.PARAMETER MinGroupMembers
+    The fewest members assigned to each group.
+    The default can also be set in overrides\overrides.psd1, key MinGroupMembers. A value given
+    here wins over it.
+.PARAMETER MaxGroupMembers
+    The most members assigned to each group.
+    The default can also be set in overrides\overrides.psd1, key MaxGroupMembers. A value given
+    here wins over it.
+.PARAMETER MinDA
+    The fewest users added to Domain Admins. The number is random within the range.
+    The default can also be set in overrides\overrides.psd1, key MinDA. A value given
+    here wins over it.
+.PARAMETER MaxDA
+    The most users added to Domain Admins.
+    The default can also be set in overrides\overrides.psd1, key MaxDA. A value given
+    here wins over it.
+.PARAMETER MaxGroupNestingDepth
+    The deepest group-in-group nesting.
+    The default can also be set in overrides\overrides.psd1, key MaxGroupNestingDepth. A value given
+    here wins over it.
+.PARAMETER RandomSeed
+    Seeds the random number generator for a reproducible run. 0 means no seed, so
+    each run differs.
+    The default can also be set in overrides\overrides.psd1, key RandomSeed. A value given
+    here wins over it.
 .EXAMPLE
     .\Initialize-ADDirectory.ps1
     .\Initialize-ADDirectory.ps1 -UserCount 500 -GroupCount 25
 .NOTES
-    Version:      2.0.0
+    Version:      2.1.0
     Author:       Daniel Owen
-    Release Date: 2026-11-05
+    Release Date: 2026-11-12
     Requirements: Windows Server 2025, PowerShell 5.1+, Domain Administrator
 #>
 
@@ -70,7 +117,35 @@ if (-not (Test-Path $logFuncsPath)) {
 . $logFuncsPath
 #endregion
 
+#region Override File Parameters
+# The override file's values for this script's parameters, which global-config.ps1 read.
+# Each is applied here, at script level, with Set-Variable, so the parameter's own
+# attributes check it. A function or a scriptblock run with & would set a copy and leave
+# the parameter alone. A parameter given on the command line keeps its value. A refused
+# value leaves the default, and the run stops once logging has started.
+$overrideAssignmentResult  = $null
+$overrideAssignmentRefused = [System.Collections.Generic.List[object]]::new()
+$overrideAssignedKeys      = @{}
+if (-not $overrideFileError -and $null -ne $overrideFileResult -and
+    (Get-Command -Name 'Get-OverrideParameterAssignment' -CommandType Function -ErrorAction SilentlyContinue)) {
+    $overrideAssignmentResult = Get-OverrideParameterAssignment -OverrideFile $overrideFileResult -CatalogPath $overrideFileCatalogPath -BoundParameters $PSBoundParameters
+    foreach ($overrideAssignment in @($overrideAssignmentResult.Assignments)) {
+        try {
+            Set-Variable -Name $overrideAssignment.ParameterName -Value $overrideAssignment.Value
+            $overrideAssignedKeys[$overrideAssignment.ParameterName] = $overrideAssignment.Key
+        } catch {
+            $overrideAssignmentRefused.Add($overrideAssignment)
+        }
+    }
+}
+#endregion
+
 #region Script-Local Configuration
+# Equal to the Version line above. The "started" line logs it.
+$scriptVersion               = '2.1.0'
+# The oldest include\global-config.ps1 this script runs with: the first with the
+# override file.
+$requiredGlobalConfigVersion = '2.1.0'
 $transcriptPath        = "$logPath\Initialize-ADDirectory-$(Get-Date -Format yyyyMMddHHmmss).log"
 #endregion
 
@@ -309,8 +384,13 @@ function Install-EnterpriseRootCA {
 function Set-TimeConfiguration {
     param([string[]]$NtpServersParam)
     try {
-        $ntpList = $NtpServersParam -join ','
-        $null = w32tm /config /manualpeerlist:$ntpList /syncfromflags:manual /reliable:yes /update
+        # /manualpeerlist takes a space-delimited list, with more than one peer in
+        # quotation marks, as one argument (Microsoft, "Windows Time Service Tools and
+        # Settings"). A comma would separate a peer from its flags, such as ,0x8. One peer
+        # is passed as before.
+        $ntpList = @($NtpServersParam) -join ' '
+        $peerListArgument = if (@($NtpServersParam).Count -gt 1) { "/manualpeerlist:`"$ntpList`"" } else { "/manualpeerlist:$ntpList" }
+        $null = w32tm /config $peerListArgument /syncfromflags:manual /reliable:yes /update
         if ($LASTEXITCODE -ne 0) {
             throw "w32tm /config failed with exit code $LASTEXITCODE."
         }
@@ -408,8 +488,10 @@ function Export-DiagnosticReports {
 
 #region --- CSV Validation ---
 function Test-AllCsvFiles {
+    # CsvFilePathsParam maps each CSV name to the file to read, which global-config.ps1
+    # resolved: a replacement under overrides\config, or the shipped config\ file.
     param(
-        [string]$CsvBasePath,
+        [System.Collections.IDictionary]$CsvFilePathsParam,
         [string]$DomainNameParam
     )
     $failures = @()
@@ -428,13 +510,14 @@ function Test-AllCsvFiles {
     )
 
     foreach ($spec in $csvSpecs) {
-        $filePath = Join-Path $CsvBasePath $($spec.File)
-        if (-not (Test-Path $filePath)) {
+        $filePath = [string]$CsvFilePathsParam[$($spec.File)]
+        if (-not $filePath -or -not (Test-Path -LiteralPath $filePath)) {
             $failures += "MISSING: $($spec.File)"
             continue
         }
         try {
-            $data = Import-Csv $filePath
+            # @() so a single row counts as one. Windows PowerShell 5.1 gives one row as a lone object with no Count.
+            $data = @(Import-Csv -LiteralPath $filePath)
             # Guard: Select-Object -First 1 returns $null on an empty dataset, causing .PSObject.Properties to throw.
             # The MinRows check below is the correct surface for zero-row files.
             if ($data.Count -gt 0) {
@@ -454,11 +537,16 @@ function Test-AllCsvFiles {
 
     # A brace left in an SPN after {DomainName} substitution is a misspelled placeholder
     # such as {Domain}. Test-ServicePrincipalNamePlaceholder comes from include\BuildProfile.ps1.
-    $serviceAccountCsvPath = Join-Path $CsvBasePath 'serviceaccounts.csv'
-    if (Test-Path $serviceAccountCsvPath) {
+    $serviceAccountCsvPath = [string]$CsvFilePathsParam['serviceaccounts.csv']
+    if ($serviceAccountCsvPath -and (Test-Path -LiteralPath $serviceAccountCsvPath)) {
         try {
             foreach ($placeholderRow in @(Test-ServicePrincipalNamePlaceholder -CsvPath $serviceAccountCsvPath -DomainName $DomainNameParam)) {
                 $failures += "UNRESOLVED PLACEHOLDER in serviceaccounts.csv row $($placeholderRow.RowNumber) (Name '$($placeholderRow.Name)'): SPN '$($placeholderRow.ServicePrincipalName)' still holds a brace after {DomainName} substitution ('$($placeholderRow.ResolvedServicePrincipalName)'). Write the placeholder as {DomainName}."
+            }
+            # A literal SPN naming a host in another domain is allowed, so it is only a
+            # WARN. It is how a 1.0 CSV's lab.local SPNs look in a lab.test forest.
+            foreach ($otherDomainRow in @(Test-ServicePrincipalNameDomain -CsvPath $serviceAccountCsvPath -DomainName $DomainNameParam)) {
+                Write-LogWarn "serviceaccounts.csv row $($otherDomainRow.RowNumber) (Name '$($otherDomainRow.Name)'): SPN '$($otherDomainRow.ServicePrincipalName)' names host '$($otherDomainRow.HostName)', which is outside the build's domain '$DomainNameParam'. It is written as given. If it should follow the domain, write it as '$($otherDomainRow.SuggestedServicePrincipalName)'."
             }
         } catch {
             $failures += "UNREADABLE: serviceaccounts.csv -- $_"
@@ -473,19 +561,21 @@ function Test-AllCsvFiles {
 }
 
 function Import-LabCsvData {
-    param([string]$CsvPathParam)
+    # CsvFilePathsParam maps each CSV name to the file to read, as for Test-AllCsvFiles.
+    param([System.Collections.IDictionary]$CsvFilePathsParam)
     try {
-        $script:firstNames      = Import-Csv "$CsvPathParam\first.csv"
-        $script:lastNames       = Import-Csv "$CsvPathParam\last.csv"
-        $script:wordSeeds       = Import-Csv "$CsvPathParam\words.csv"
-        $script:departments     = Import-Csv "$CsvPathParam\departments.csv"
-        $script:titles          = Import-Csv "$CsvPathParam\titles.csv"
-        $script:offices         = Import-Csv "$CsvPathParam\offices.csv"
-        $script:cities          = Import-Csv "$CsvPathParam\cities.csv"
-        $script:companies       = Import-Csv "$CsvPathParam\companies.csv"
-        $script:streets         = Import-Csv "$CsvPathParam\streets.csv"
-        $script:computerSeeds   = Import-Csv "$CsvPathParam\computers.csv"
-        $script:serviceAcctDefs = Import-Csv "$CsvPathParam\serviceaccounts.csv"
+        # @() so a single row counts as one. Windows PowerShell 5.1 gives one row as a lone object with no Count.
+        $script:firstNames      = @(Import-Csv -LiteralPath $CsvFilePathsParam['first.csv'])
+        $script:lastNames       = @(Import-Csv -LiteralPath $CsvFilePathsParam['last.csv'])
+        $script:wordSeeds       = @(Import-Csv -LiteralPath $CsvFilePathsParam['words.csv'])
+        $script:departments     = @(Import-Csv -LiteralPath $CsvFilePathsParam['departments.csv'])
+        $script:titles          = @(Import-Csv -LiteralPath $CsvFilePathsParam['titles.csv'])
+        $script:offices         = @(Import-Csv -LiteralPath $CsvFilePathsParam['offices.csv'])
+        $script:cities          = @(Import-Csv -LiteralPath $CsvFilePathsParam['cities.csv'])
+        $script:companies       = @(Import-Csv -LiteralPath $CsvFilePathsParam['companies.csv'])
+        $script:streets         = @(Import-Csv -LiteralPath $CsvFilePathsParam['streets.csv'])
+        $script:computerSeeds   = @(Import-Csv -LiteralPath $CsvFilePathsParam['computers.csv'])
+        $script:serviceAcctDefs = @(Import-Csv -LiteralPath $CsvFilePathsParam['serviceaccounts.csv'])
         Write-LogInfo "All CSV data loaded."
     } catch {
         Write-LogError "CSV data import failed: $_"
@@ -546,6 +636,8 @@ function Get-RandomIdentity {
 }
 
 function New-CompliantPassword {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'The lab generates each password here and keeps the plain text too, because the users export in the artifacts folder lists every generated password.')]
     param([int]$Length)
     # Range 33-126 covers all printable ASCII (94 chars). $Length must be <= 94 for no-replacement pick.
     if ($Length -gt 94) {
@@ -559,8 +651,8 @@ function New-CompliantPassword {
     do {
         $rawPassword = -join ((33..126) | Get-Random -Count $Length | ForEach-Object { [char]$_ })
     } while (
-        $rawPassword -notmatch '[A-Z]' -or
-        $rawPassword -notmatch '[a-z]' -or
+        $rawPassword -cnotmatch '[A-Z]' -or
+        $rawPassword -cnotmatch '[a-z]' -or
         $rawPassword -notmatch '\d'    -or
         $rawPassword -notmatch '[^a-zA-Z0-9]'
     )
@@ -773,7 +865,7 @@ function New-LabUsers {
         [int]$Count,
         [string]$UpnPatternParam,
         [string]$DomainNameParam,
-        [string]$UsersOUParam,
+        [string]$EmployeeOUParam,
         [int]$PasswordLengthParam,
         [array]$FirstNamesData,
         [array]$LastNamesData,
@@ -783,7 +875,7 @@ function New-LabUsers {
         [array]$OfficesData,
         [array]$CitiesData,
         [array]$StreetsData,
-        [int]$PctRemoteUsersParam,
+        [int]$PctRemoteParam,
         [string]$SharedCityName,
         [string]$SharedCityState
     )
@@ -826,7 +918,7 @@ function New-LabUsers {
             $department  = $($DepartmentsData | Get-Random).Department
             $title       = $($TitlesData      | Get-Random).Title
             $company     = $($ActiveCompaniesData | Get-Random).Company
-            $isRemote    = (Get-Random -Minimum 1 -Maximum 101) -le $PctRemoteUsersParam
+            $isRemote    = (Get-Random -Minimum 1 -Maximum 101) -le $PctRemoteParam
             if ($isRemote) {
                 $office     = 'Remote'
                 $cityRecord = $CitiesData | Get-Random
@@ -854,7 +946,7 @@ function New-LabUsers {
             $localPhone      = $phone
             $localEmpId      = $employeeId
             $localPwSecure   = $pwResult.Secure
-            $localUsersOU    = $UsersOUParam
+            $localUsersOU    = $EmployeeOUParam
 
             Invoke-ADWriteWithRetry -OperationName "New-ADUser $localSam" -Operation {
                 $null = New-ADUser `
@@ -1123,7 +1215,7 @@ function New-ComputerObjects {
     )
 
     foreach ($typeDef in $typeDistributions) {
-        for ($i = 1; $i -le $typeDef.Count; $i++) {
+        for ($i = 1; $i -le $typeDef['Count']; $i++) {
             try {
                 $seed        = $($Seeds | Get-Random).Seed
                 $indexStr    = "-$i"
@@ -1826,10 +1918,15 @@ try {
         -CsvLogPathParam $csvErrorLogPath
     Start-Transcript -Path $transcriptPath
 
-    Write-LogInfo "Initialize-ADDirectory.ps1 started."
+    Write-LogInfo "Initialize-ADDirectory.ps1 $scriptVersion started."
 
-    # Build profile results from include\global-config.ps1, logged now that logging has
-    # started. The logon task is still registered, so a fixed profile re-runs at logon.
+    if (-not (Test-GlobalConfigVersion -FoundVersionParam $globalConfigVersion -RequiredVersionParam $requiredGlobalConfigVersion -ScriptNameParam 'Initialize-ADDirectory.ps1')) {
+        throw "Stopping: include\global-config.ps1 is older than this script needs (error above). Fix it, then log on again to let the logon task re-run population, or run this script again."
+    }
+
+    # Override file and build profile results from include\global-config.ps1, logged now
+    # that logging has started. The logon task is still registered, so a fixed profile
+    # re-runs at logon.
     $buildProfileFailed = Write-BuildProfileResult `
         -SummaryParam  $buildProfileSummary `
         -InfoParam     $buildProfileInfo `
@@ -1838,6 +1935,64 @@ try {
     if ($buildProfileFailed) {
         throw "Stopping: the build profile check failed (error above). Fix it, then log on again to let the logon task re-run population, or run this script again."
     }
+
+    #region Override File Parameters, Checked
+    # The assignments made after global-config.ps1 was loaded, and what they couldn't do.
+    if ($null -ne $overrideAssignmentResult) {
+        foreach ($overrideLine in @($overrideAssignmentResult.Info)) { if ($overrideLine) { Write-LogInfo $overrideLine } }
+        foreach ($overrideLine in @($overrideAssignmentResult.Warnings)) { if ($overrideLine) { Write-LogWarn $overrideLine } }
+        if ($overrideAssignmentResult.Error) {
+            foreach ($overrideLine in ($overrideAssignmentResult.Error -split '\r?\n')) { if ($overrideLine) { Write-LogError $overrideLine } }
+            throw "Stopping: the override file's parameter values couldn't be applied (error above). Fix it, then log on again to let the logon task re-run population, or run this script again."
+        }
+    }
+    if ($overrideAssignmentRefused.Count -gt 0) {
+        foreach ($refusedAssignment in $overrideAssignmentRefused) {
+            Write-LogError "$($overrideFileLabel): $($refusedAssignment.Key) '$($refusedAssignment.Value)' isn't valid for -$($refusedAssignment.ParameterName), whose own checks refused it. OVERRIDE.md lists its permitted values."
+        }
+        throw "Stopping: the override file holds a value this script's parameters refuse (error above). Fix it, then log on again to let the logon task re-run population, or run this script again."
+    }
+
+    # The count pairs, with the command line's values: a value is set when the command
+    # line gave it, the override file gave it, or the script's default differs from the
+    # shipped one. An inherited value gives way to a set one with a WARN. Two set values
+    # that clash stop the run here, before anything is created.
+    foreach ($countPair in @(@('MinGroupMembers', 'MaxGroupMembers'), @('MinDA', 'MaxDA'))) {
+        $pairArguments = @{ MinKey = $countPair[0]; MaxKey = $countPair[1] }
+        foreach ($pairSide in @(@('Min', $countPair[0]), @('Max', $countPair[1]))) {
+            $pairName   = $pairSide[1]
+            $pairValue  = [int](Get-Variable -Name $pairName -ValueOnly)
+            $pairSource = ''
+            if ($PSBoundParameters.ContainsKey($pairName)) {
+                $pairSource = 'Command line'
+            } elseif ($overrideAssignedKeys.ContainsKey($pairName)) {
+                $pairSource = $overrideFileLabel
+            } elseif ($null -eq $overrideFileCatalog -or $null -eq $overrideFileCatalog.Settings[$pairName] -or [int]$overrideFileCatalog.Settings[$pairName].Shipped -ne $pairValue) {
+                $pairSource = 'Initialize-ADDirectory.ps1'
+            }
+            $pairArguments["$($pairSide[0])Value"]  = $pairValue
+            $pairArguments["$($pairSide[0])Source"] = $pairSource
+        }
+        $pairResult = Resolve-MinMaxPair @pairArguments
+        if ($pairResult.Error) {
+            Write-LogError $pairResult.Error
+            throw "Stopping: $($countPair[0]) and $($countPair[1]) clash (error above). Fix them, then log on again to let the logon task re-run population, or run this script again."
+        }
+        if ($pairResult.Warning) {
+            Write-LogWarn $pairResult.Warning
+            Set-Variable -Name $countPair[0] -Value $pairResult.Min
+            Set-Variable -Name $countPair[1] -Value $pairResult.Max
+        }
+    }
+
+    if ($PasswordLength -lt $minPasswordLength) {
+        Write-LogWarn "PasswordLength $PasswordLength is below MinPasswordLength $minPasswordLength, so the generated passwords are shorter than the domain policy asks for. Using it as given."
+    }
+
+    # One INFO line per shipped default that changed since the previous release, for a
+    # setting this run left at that default, the command line's parameters included.
+    Write-OverrideChangedDefault -CatalogPathParam $overrideFileCatalogPath -ReleaseTablePathParam $overrideFileReleaseTablePath -CurrentVersionParam $scriptVersion -SetKeyParam $overrideFileSetKeys -BoundParameterNameParam @($PSBoundParameters.get_Keys())
+    #endregion
 
     if ($RandomSeed -ne 0) {
         $null = Get-Random -SetSeed $RandomSeed
@@ -1853,8 +2008,8 @@ try {
     #region CSV Validation and Load
     # Before the logon task is removed, so a CSV fix plus a logon re-runs population.
     # Both only read files.
-    Test-AllCsvFiles  -CsvBasePath  $csvPath -DomainNameParam $domainName
-    Import-LabCsvData -CsvPathParam $csvPath
+    Test-AllCsvFiles  -CsvFilePathsParam $overrideFileCsvPaths -DomainNameParam $domainName
+    Import-LabCsvData -CsvFilePathsParam $overrideFileCsvPaths
     #endregion
 
     Remove-PopulateScheduledTask -TaskNameParam $scheduledTaskName
@@ -1904,7 +2059,7 @@ try {
                         -Count               $UserCount `
                         -UpnPatternParam     $upnPattern `
                         -DomainNameParam     $domainName `
-                        -UsersOUParam        $usersOU `
+                        -EmployeeOUParam     $usersOU `
                         -PasswordLengthParam $PasswordLength `
                         -FirstNamesData      $script:firstNames `
                         -LastNamesData       $script:lastNames `
@@ -1914,7 +2069,7 @@ try {
                         -OfficesData         $script:offices `
                         -CitiesData          $script:cities `
                         -StreetsData         $script:streets `
-                        -PctRemoteUsersParam $pctRemoteUsers `
+                        -PctRemoteParam      $pctRemoteUsers `
                         -SharedCityName      $($sharedCityRecord.City) `
                         -SharedCityState     $($sharedCityRecord.State)
 
