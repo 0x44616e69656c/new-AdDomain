@@ -22,7 +22,12 @@
       2. Load and validate: dot-sources include\BuildProfile.ps1, keeps the user-state
          percentages and the count pairs consistent, and calls Get-BuildProfile, which
          applies include\build-profile.psd1 when it exists, replaces empty values,
-         validates every value and returns the effective ones.
+         validates every value and returns the effective ones. The population settings
+         (the profile's PopulationSeed, Population and DomainAdminCount, else the
+         override file's values, else Initialize-ADDirectory.ps1's defaults) land in
+         $buildProfilePopulation, and a profile's NetworkType in
+         $buildProfileNetworkType, which only build-lab reads. A PasswordLength in the
+         override file below the effective MinPasswordLength gets its WARN here too.
       3. The derived values: $forestName, $domainDN and the OU paths. Skipped when part
          1b or part 2 found an error.
 
@@ -35,10 +40,13 @@
 .EXAMPLE
     . .\global-config.ps1
 .NOTES
-    Version:      2.1.0
+    Version:      2.2.0
     Author:       Daniel Owen
-    Release Date: 2026-11-12
+    Release Date: 2026-11-25
+    SPDX-License-Identifier: MIT
     Requirements: PowerShell 5.1+
+.LINK
+    https://github.com/0x44616e69656c/new-AdDomain
 #>
 
 #region Deployment Root
@@ -50,7 +58,7 @@ $deployRoot              = Split-Path -Path $PSScriptRoot -Parent
 # Equal to the Version line above. Each script stops when this is missing or older than
 # the global-config.ps1 it needs, which catches an older copy of this file put back over
 # this one.
-$globalConfigVersion     = '2.1.0'
+$globalConfigVersion     = '2.2.0'
 #endregion
 
 #region Part 1: Base Values
@@ -287,6 +295,8 @@ $buildProfileInfo        = [string[]]@()
 $buildProfileWarnings    = [string[]]@()
 $buildProfileError       = $null
 $buildProfileDomainSource = $null
+$buildProfilePopulation  = $null
+$buildProfileNetworkType = $null
 $buildProfileScriptPath  = Join-Path -Path $PSScriptRoot -ChildPath 'BuildProfile.ps1'
 $buildProfileDataPath    = Join-Path -Path $PSScriptRoot -ChildPath 'build-profile.psd1'
 
@@ -351,6 +361,24 @@ if (-not $buildProfileError) {
             if ($overrideFilePairResult.Error) { $overrideFilePairErrList.Add($overrideFilePairResult.Error) }
             elseif ($overrideFilePairResult.Warning) { $overrideFilePairWarnList.Add($overrideFilePairResult.Warning) }
         }
+
+        # Generated passwords are never shorter than the domain's effective minimum. The
+        # host sees the override file's PasswordLength here. Script two checks again with
+        # its command line before it creates any account.
+        $overrideFileLengthValue = $null
+        if ($overrideFileValues.ContainsKey('PasswordLength')) { $overrideFileLengthValue = $overrideFileValues['PasswordLength'] -as [int] }
+        $overrideFileMinLengthValue = $minPasswordLength -as [int]
+        if ($null -ne $overrideFileLengthValue -and $null -ne $overrideFileMinLengthValue) {
+            $overrideFileLengthResult = Resolve-GeneratedPasswordLength -PasswordLength $overrideFileLengthValue -Source $overrideFileLabel -MinPasswordLength $overrideFileMinLengthValue
+            if ($overrideFileLengthResult.Warning) { $overrideFilePairWarnList.Add($overrideFileLengthResult.Warning) }
+        }
+    }
+
+    # The override file's values for the parameters the build profile's population keys
+    # set. Get-BuildProfile merges them, so the host and the guest get the same values.
+    $buildProfileOverrideValues = @{}
+    foreach ($buildProfileOverrideKey in @('RandomSeed', 'Population', 'DomainAdminCount')) {
+        if ($overrideFileValues.ContainsKey($buildProfileOverrideKey)) { $buildProfileOverrideValues[$buildProfileOverrideKey] = $overrideFileValues[$buildProfileOverrideKey] }
     }
 
     $buildProfileArguments = @{
@@ -368,6 +396,10 @@ if (-not $buildProfileError) {
     if ($overrideFileSources.get_Count() -gt 0) {
         $buildProfileArguments['FileSources'] = $overrideFileSources
     }
+    if ($buildProfileOverrideValues.get_Count() -gt 0) {
+        $buildProfileArguments['OverrideParameterValues'] = $buildProfileOverrideValues
+        $buildProfileArguments['OverrideParameterLabel']  = $overrideFileLabel
+    }
     $buildProfileResult   = Get-BuildProfile @buildProfileArguments
     $buildProfileSummary  = $buildProfileResult.Summary
     $buildProfileInfo     = [string[]]@($buildProfileResult.Info)
@@ -383,6 +415,13 @@ if (-not $buildProfileError) {
         $primarySiteName = $buildProfileResult.PrimarySiteName
         $primarySubnet   = $buildProfileResult.PrimarySubnet
         $buildProfileDomainSource = $buildProfileResult.DomainNameSource
+        $buildProfilePopulation   = [pscustomobject]@{
+            PopulationSeed   = $buildProfileResult.PopulationSeed
+            Population       = $buildProfileResult.Population
+            DomainAdminCount = $buildProfileResult.DomainAdminCount
+            PopulationSource = $buildProfileResult.PopulationSource
+        }
+        $buildProfileNetworkType  = $buildProfileResult.NetworkType
     }
 }
 
@@ -409,6 +448,11 @@ $buildProfileWarnings     = [string[]](@($overrideFileWarnings) + @($buildProfil
 if ($overrideFileError) {
     if ($buildProfileError) { $buildProfileError = $overrideFileError + [Environment]::NewLine + $buildProfileError }
     else { $buildProfileError = $overrideFileError }
+}
+# On any error the run stops, so no population setting is handed on.
+if ($buildProfileError) {
+    $buildProfilePopulation  = $null
+    $buildProfileNetworkType = $null
 }
 #endregion
 

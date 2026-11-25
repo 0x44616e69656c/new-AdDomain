@@ -28,6 +28,8 @@
                                                at a sum of 100 or less
       - Resolve-MinMaxPair                   : keeps a minimum no higher than its
                                                maximum
+      - Resolve-GeneratedPasswordLength      : raises a generated password length to the
+                                               domain's effective minimum
       - Get-IPv4NetworkAddress               : the network address of an address and
                                                prefix, in CIDR form
       - Test-IPv4AddressInSubnet             : whether an address is inside a subnet
@@ -46,13 +48,16 @@
 .OUTPUTS
     None when dot-sourced. Get-BuildProfile returns one PSCustomObject. See each function.
 .NOTES
-    Version:           2.1.0
+    Version:           2.2.0
     Author:            Daniel Owen
-    Release Date:      2026-11-12
+    Release Date:      2026-11-25
+    SPDX-License-Identifier: MIT
     Requirements:      PowerShell 5.1+
     Target Set Source: N/A
     Event Log Source:  N/A
     Setup:             N/A
+.LINK
+    https://github.com/0x44616e69656c/new-AdDomain
 #>
 
 
@@ -259,6 +264,9 @@ function ConvertTo-BuildProfileSetting {
     }
     $text = if ($null -eq $Value) { '' } else { ([string]$Value).Trim() }
     $isString = $Value -is [string]
+    # A whole number written as an integer of any width, or as a string of digits.
+    $isWholeNumber = ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte]) -or
+                     ($isString -and $text -match '\A[0-9]{1,10}\z')
 
     switch ($Key) {
         'DomainName' {
@@ -284,8 +292,6 @@ function ConvertTo-BuildProfileSetting {
             }
         }
         'RequiredOSBuild' {
-            $isWholeNumber = ($Value -is [int] -or $Value -is [long] -or $Value -is [int16] -or $Value -is [byte]) -or
-                             ($isString -and $text -match '\A[0-9]{1,10}\z')
             if ($isWholeNumber -and [long]$text -ge 0 -and [long]$text -le [int]::MaxValue) {
                 $result.Valid = $true; $result.Value = [int]$text
             } else {
@@ -306,6 +312,43 @@ function ConvertTo-BuildProfileSetting {
                 $result.Valid = $true; $result.Value = $text
             } else {
                 $result.Problem = "'$text' is not valid. Use Auto, or an IPv4 subnet in CIDR form with a prefix of 8 to 30, such as 192.168.159.0/24."
+            }
+        }
+        'PopulationSeed' {
+            if ($isString -and $text -eq 'Random') {
+                $result.Valid = $true; $result.Value = 'Random'
+            } elseif ($isWholeNumber -and [long]$text -ge 1 -and [long]$text -le [int]::MaxValue) {
+                $result.Valid = $true; $result.Value = [int]$text
+            } else {
+                $result.Problem = "'$text' is not valid. Use Random, or a whole number from 1 to 2147483647, such as 20261028."
+            }
+        }
+        'Population' {
+            $canonicalPopulation = @('Full', 'Minimal', 'None') | Where-Object { $isString -and $_ -eq $text }
+            if ($canonicalPopulation) {
+                $result.Valid = $true; $result.Value = [string]$canonicalPopulation
+            } else {
+                $result.Problem = "'$text' is not valid. Use Full, Minimal or None."
+            }
+        }
+        'DomainAdminCount' {
+            if ($isString -and $text -eq 'Random') {
+                $result.Valid = $true; $result.Value = 'Random'
+            } elseif ($isWholeNumber -and [long]$text -ge 0 -and [long]$text -le [int]::MaxValue) {
+                $result.Valid = $true; $result.Value = [int]$text
+            } else {
+                $result.Problem = "'$text' is not valid. Use Random, or a whole number from 0 to 2147483647, such as 2."
+            }
+        }
+        'NetworkType' {
+            # The canonical spelling only. build-lab maps VMnet0, VMnet1 and VMnet8 to
+            # bridged, hostonly and nat on the host.
+            if ($isString -and $text -match '\A(?:nat|bridged|hostonly)\z') {
+                $result.Valid = $true; $result.Value = $text.ToLowerInvariant()
+            } elseif ($isString -and $text -match '\AVMnet(0|[1-9][0-9]?)\z') {
+                $result.Valid = $true; $result.Value = "VMnet$($Matches[1])"
+            } else {
+                $result.Problem = "'$text' is not valid. Use nat, bridged, hostonly, or VMnet0 to VMnet99, such as VMnet2."
             }
         }
     }
@@ -329,6 +372,14 @@ function Get-BuildProfile {
         label when the profile sets DomainName and leaves NetBIOSName out or empty, when
         the override file sets DomainName and neither the override file nor the profile
         sets NetBIOSName, or when $netBIOSName is empty.
+
+        Three more keys set Initialize-ADDirectory.ps1's population: PopulationSeed (its
+        -RandomSeed, in the profile's own words, Random or a whole number from 1 up),
+        Population and DomainAdminCount. They have no global-config.ps1 value, so a key
+        left out or empty takes the override file's value from OverrideParameterValues
+        (an override RandomSeed of 0 reads Random), and otherwise the script's default:
+        Random, Full and Random. NetworkType is build-lab's: it is validated here, and
+        neither guest script uses it.
     .PARAMETER DomainName
         $domainName from global-config.ps1.
     .PARAMETER NetBIOSName
@@ -351,14 +402,23 @@ function Get-BuildProfile {
         about such a value starts with that label and names the key. Omit it, or pass an
         empty table, when no value came from the override file, and every line is as
         it was before override files.
+    .PARAMETER OverrideParameterValues
+        The override file's values for RandomSeed, Population and DomainAdminCount, as the
+        reader returned them. Omit it, or leave a key out, when the file doesn't set it.
+    .PARAMETER OverrideParameterLabel
+        The override file's label, such as "Override file '<path>'", for the lines about
+        a value from OverrideParameterValues.
     .OUTPUTS
         PSCustomObject with DomainName, NetBIOSName, ForestMode, DomainMode,
         RequiredOSBuild, PrimarySiteName, PrimarySubnet (all $null when Error is set),
         DomainNameSource (Profile, OverrideFile, GlobalConfigEdited or Shipped, $null
-        when Error is set), ProfileKeys (the keys whose value came from the profile,
-        a NetBIOS name derived from its DomainName included, empty when Error is set),
-        ProfilePath, Summary ($null when Error is set), Info and
-        Warnings (string arrays) and Error ($null, or one stop per line).
+        when Error is set), ProfileKeys (the catalog keys whose value came from the
+        profile, a NetBIOS name derived from its DomainName included, and RandomSeed for
+        a profile PopulationSeed; empty when Error is set), PopulationSeed, Population,
+        DomainAdminCount and PopulationSource (Profile, OverrideFile or Default per key;
+        all $null when Error is set), NetworkType ($null when not set or when Error is
+        set), ProfilePath, Summary ($null when Error is set), Info and Warnings (string
+        arrays) and Error ($null, or one stop per line).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -371,7 +431,9 @@ function Get-BuildProfile {
         [AllowNull()][object]$PrimarySiteName,
         [AllowNull()][object]$PrimarySubnet,
         [string]$ProfilePath,
-        [AllowNull()][hashtable]$FileSources
+        [AllowNull()][hashtable]$FileSources,
+        [AllowNull()][hashtable]$OverrideParameterValues,
+        [string]$OverrideParameterLabel
     )
     $ErrorActionPreference = 'Stop'
 
@@ -380,6 +442,14 @@ function Get-BuildProfile {
     $errorLines   = [System.Collections.Generic.List[string]]::new()
     $effective    = [ordered]@{}
     $keyNames     = @('DomainName', 'NetBIOSName', 'ForestMode', 'DomainMode', 'RequiredOSBuild', 'PrimarySiteName', 'PrimarySubnet')
+    # Every key a profile takes, in the order the unknown-key error lists them. The first
+    # seven are $keyNames, which take global-config.ps1 values. The population keys set
+    # Initialize-ADDirectory.ps1's parameters, and NetworkType is build-lab's.
+    $validKeyNames = @('DomainName', 'NetBIOSName', 'ForestMode', 'DomainMode', 'RequiredOSBuild', 'PrimarySiteName', 'PrimarySubnet', 'PopulationSeed', 'Population', 'DomainAdminCount', 'NetworkType')
+    $populationKeyNames = @('PopulationSeed', 'Population', 'DomainAdminCount')
+    $populationResult   = [ordered]@{}
+    $populationSource   = @{}
+    $networkTypeValue   = $null
 
     try {
         $fileValues = @{
@@ -392,22 +462,27 @@ function Get-BuildProfile {
             PrimarySubnet   = $PrimarySubnet
         }
         $builtInValues = Get-BuildProfileBuiltInValue
+        # Keys reserved for a later version. Empty, one is ignored with a WARN, and with a
+        # value it stops the run. Only the keys are read, so every value is $null.
+        # OverrideFile.ps1's Get-OverrideProfileKeyName reads the keys from this literal for
+        # OVERRIDE.md, so keep its name and its [ordered]@{ Key = value } shape.
         $laterItemKeys = [ordered]@{
-            BuildName            = 'plan item 4'
-            RandomSeed           = 'plan item 3'
-            Population           = 'plan item 3'
-            DomainAdminCount     = 'plan item 3'
+            BuildName            = $null
             CertificateAuthority = $null
-            VirtualNetwork       = 'plan item 10'
-            Machines             = 'plan item 8'
-            Trusts               = 'plan item 9'
+            Machines             = $null
+            Trusts               = $null
         }
         $derivedKeys = @('DomainDN', 'ForestName', 'UsersOU', 'GroupsOU', 'ServersOU', 'WorkstationsOU', 'AdminsOU', 'ServiceAccountsOU', 'DisabledUsersOU', 'QuarantineOU')
+        # A draft name with a value stops with a hint. RandomSeed is the parameter's name,
+        # which a profile spells PopulationSeed, and VirtualNetwork an earlier name for
+        # NetworkType.
         $draftKeyHints = @{
-            DomainDnsName = 'DomainName'
-            ForestDnsName = 'DomainName'
-            SiteName      = 'PrimarySiteName'
-            SiteSubnet    = 'PrimarySubnet'
+            DomainDnsName  = 'DomainName'
+            ForestDnsName  = 'DomainName'
+            SiteName       = 'PrimarySiteName'
+            SiteSubnet     = 'PrimarySubnet'
+            RandomSeed     = 'PopulationSeed'
+            VirtualNetwork = 'NetworkType'
         }
         $profilePrefix = $null
         $filePrefix    = 'global-config.ps1:'
@@ -441,13 +516,17 @@ function Get-BuildProfile {
         # Per key: 'Missing', 'Empty' or 'Value'. Without a profile every key is 'Missing'.
         $profileState = @{}
         $profileValue = @{}
-        foreach ($keyName in $keyNames) { $profileState[$keyName] = 'Missing' }
+        foreach ($keyName in $validKeyNames) { $profileState[$keyName] = 'Missing' }
         if ($null -ne $profileData) {
             foreach ($rawKey in @($profileData.get_Keys() | Sort-Object)) {
                 $rawValue     = $profileData[$rawKey]
-                $canonicalKey = $keyNames | Where-Object { $_ -eq $rawKey } | Select-Object -First 1
+                $canonicalKey = $validKeyNames | Where-Object { $_ -eq $rawKey } | Select-Object -First 1
                 $laterKey     = @($laterItemKeys.get_Keys()) | Where-Object { $_ -eq $rawKey } | Select-Object -First 1
-                if ($canonicalKey) {
+                if ($rawKey -eq 'VirtualNetwork' -and (Test-BuildProfileEmptyValue -Value $rawValue)) {
+                    # An earlier name for NetworkType. Empty, it is ignored with a WARN. With a
+                    # value it is the unknown key below.
+                    $warningLines.Add("$profilePrefix VirtualNetwork is empty and is ignored. The key is now NetworkType.")
+                } elseif ($canonicalKey) {
                     if (Test-BuildProfileEmptyValue -Value $rawValue) {
                         $profileState[$canonicalKey] = 'Empty'
                     } else {
@@ -455,25 +534,18 @@ function Get-BuildProfile {
                         $profileValue[$canonicalKey] = $rawValue
                     }
                 } elseif ($laterKey) {
-                    $laterItem = $laterItemKeys[$laterKey]
                     if (Test-BuildProfileEmptyValue -Value $rawValue) {
-                        if ($laterItem) {
-                            $warningLines.Add("$profilePrefix $laterKey is empty and is ignored until $laterItem ships.")
-                        } else {
-                            $warningLines.Add("$profilePrefix $laterKey is empty and is ignored until a plan item supports it.")
-                        }
-                    } elseif ($laterItem) {
-                        $errorLines.Add("$profilePrefix $laterKey is not supported yet ($laterItem). Remove it, or leave it empty.")
+                        $warningLines.Add("$profilePrefix $laterKey is reserved for a later version. It is empty, so it is ignored.")
                     } else {
-                        $errorLines.Add("$profilePrefix $laterKey is not supported yet (no plan item yet). Remove it, or leave it empty.")
+                        $errorLines.Add("$profilePrefix $laterKey is reserved for a later version and can't be set yet. Remove it, or leave it empty.")
                     }
                 } elseif ($derivedKeys -contains $rawKey) {
                     $errorLines.Add("$profilePrefix $rawKey can't be set. It is derived from DomainName.")
                 } else {
-                    $unknownKeyLine = "$profilePrefix unknown key '$rawKey'. Valid keys: $($keyNames -join ', ')."
+                    $unknownKeyLine = "$profilePrefix unknown key '$rawKey'. Valid keys: $($validKeyNames -join ', ')."
                     $hintKey = @($draftKeyHints.get_Keys()) | Where-Object { $_ -eq $rawKey } | Select-Object -First 1
                     if ($hintKey) {
-                        $unknownKeyLine += " Did you mean $($draftKeyHints[$hintKey])? The plan's draft key names were renamed."
+                        $unknownKeyLine += " Did you mean $($draftKeyHints[$hintKey])? That is this setting's name in a build profile."
                     }
                     $errorLines.Add($unknownKeyLine)
                 }
@@ -616,6 +688,78 @@ function Get-BuildProfile {
         }
         #endregion
 
+        #region The population keys and NetworkType
+        # Each population key: the profile's value; else the override file's value for the
+        # parameter it sets (RandomSeed for PopulationSeed, where 0 means Random); else the
+        # script's default. No global-config.ps1 value exists for them.
+        $populationDefault  = @{ PopulationSeed = 'Random'; Population = 'Full'; DomainAdminCount = 'Random' }
+        $overrideKeyOf      = @{ PopulationSeed = 'RandomSeed'; Population = 'Population'; DomainAdminCount = 'DomainAdminCount' }
+        $populationLeftOut  = [System.Collections.Generic.List[string]]::new()
+        $leftOutFromFile    = $false
+        foreach ($keyName in $populationKeyNames) {
+            $overrideKey      = $overrideKeyOf[$keyName]
+            $hasOverrideValue = $null -ne $OverrideParameterValues -and $OverrideParameterValues.ContainsKey($overrideKey) -and $null -ne $OverrideParameterValues[$overrideKey]
+            $overrideValue    = $null
+            $overrideText     = ''
+            if ($hasOverrideValue) {
+                $overrideText  = ([string]$OverrideParameterValues[$overrideKey]).Trim()
+                $overrideValue = $OverrideParameterValues[$overrideKey]
+                if ($keyName -ne 'Population') {
+                    $overrideNumber = $overrideValue -as [long]
+                    if ($keyName -eq 'PopulationSeed' -and $overrideNumber -eq 0) { $overrideValue = 'Random' }
+                    elseif ($null -ne $overrideNumber) { $overrideValue = [int]$overrideNumber }
+                }
+            }
+            if ($profileState[$keyName] -eq 'Value') {
+                $setting = ConvertTo-BuildProfileSetting -Key $keyName -Value $profileValue[$keyName]
+                if ($setting.Valid) {
+                    $populationResult[$keyName] = $setting.Value
+                    $populationSource[$keyName] = 'Profile'
+                } else {
+                    $errorLines.Add("$profilePrefix $keyName $($setting.Problem)")
+                }
+                continue
+            }
+            if ($profileState[$keyName] -eq 'Empty') {
+                if ($hasOverrideValue) {
+                    $warningLines.Add("$profilePrefix $keyName is empty; using $overrideKey from $OverrideParameterLabel, '$overrideText'.")
+                } else {
+                    $warningLines.Add("$profilePrefix $keyName is empty; using the default, $($populationDefault[$keyName]).")
+                }
+            } elseif ($null -ne $profileData) {
+                $populationLeftOut.Add($keyName)
+                if ($hasOverrideValue) { $leftOutFromFile = $true }
+            }
+            if ($hasOverrideValue) {
+                $populationResult[$keyName] = $overrideValue
+                $populationSource[$keyName] = 'OverrideFile'
+            } else {
+                $populationResult[$keyName] = $populationDefault[$keyName]
+                $populationSource[$keyName] = 'Default'
+            }
+        }
+        # The population keys left out, after the line for the seven, in the valid key order.
+        if ($populationLeftOut.Count -gt 0) {
+            $populationSourceText = if ($leftOutFromFile) { "the override file's values and Initialize-ADDirectory.ps1's defaults apply" } else { "Initialize-ADDirectory.ps1's defaults apply" }
+            $populationPairs = @($populationLeftOut | ForEach-Object { "$_=$($populationResult[$_])" }) -join ', '
+            $infoLines.Add("$profilePrefix not set in the profile, so $($populationSourceText): $populationPairs")
+        }
+
+        # NetworkType picks build-lab's network. Validated here, so a typo stops on the host
+        # and in the guest alike, and used by neither guest script.
+        if ($profileState['NetworkType'] -eq 'Value') {
+            $setting = ConvertTo-BuildProfileSetting -Key 'NetworkType' -Value $profileValue['NetworkType']
+            if ($setting.Valid) {
+                $networkTypeValue = $setting.Value
+                $infoLines.Add("$profilePrefix NetworkType '$networkTypeValue' is used by build-lab.ps1 on the host. New-ADForestDeployment.ps1 and Initialize-ADDirectory.ps1 don't use it.")
+            } else {
+                $errorLines.Add("$profilePrefix NetworkType $($setting.Problem)")
+            }
+        } elseif ($profileState['NetworkType'] -eq 'Empty') {
+            $warningLines.Add("$profilePrefix NetworkType is empty; build-lab's -NetworkType applies.")
+        }
+        #endregion
+
         #region Fallbacks that combine values
         # The second source is named only when it differs from the first.
         $originOf = @{}
@@ -680,7 +824,10 @@ function Get-BuildProfile {
     $domainNameSource = $null
     $profileKeys      = [string[]]@()
     if ($errorLines.Count -eq 0) {
-        $profileKeys = [string[]]@($keyNames | Where-Object { $sourceOf[$_] -eq 'Profile' })
+        # Catalog key names, for the changed-default check: a profile PopulationSeed sets the
+        # catalog's RandomSeed.
+        $profilePopulationKeys = @($populationKeyNames | Where-Object { $populationSource[$_] -eq 'Profile' } | ForEach-Object { if ($_ -eq 'PopulationSeed') { 'RandomSeed' } else { $_ } })
+        $profileKeys = [string[]](@($keyNames | Where-Object { $sourceOf[$_] -eq 'Profile' }) + $profilePopulationKeys)
         $valuePairs  = ($keyNames | ForEach-Object { "$_=$($effective[$_])" }) -join ', '
         $anyOverride = @($keyNames | Where-Object { $null -ne $overrideLabelOf[$_] }).Count -gt 0
         if ($ProfilePath) {
@@ -704,6 +851,8 @@ function Get-BuildProfile {
 
     $profilePathValue = $null
     if ($ProfilePath) { $profilePathValue = $ProfilePath }
+    $populationSourceValue = $null
+    if (-not $errorText) { $populationSourceValue = $populationSource.Clone() }
 
     return [pscustomobject]@{
         DomainName      = $(if ($errorText) { $null } else { [string]$effective['DomainName'] })
@@ -715,6 +864,11 @@ function Get-BuildProfile {
         PrimarySubnet   = $(if ($errorText) { $null } else { [string]$effective['PrimarySubnet'] })
         DomainNameSource = $(if ($errorText) { $null } else { $domainNameSource })
         ProfileKeys     = $(if ($errorText) { [string[]]@() } else { $profileKeys })
+        PopulationSeed   = $(if ($errorText) { $null } else { $populationResult['PopulationSeed'] })
+        Population       = $(if ($errorText) { $null } else { [string]$populationResult['Population'] })
+        DomainAdminCount = $(if ($errorText) { $null } else { $populationResult['DomainAdminCount'] })
+        PopulationSource = $populationSourceValue
+        NetworkType      = $(if ($errorText) { $null } else { $networkTypeValue })
         ProfilePath     = $profilePathValue
         Summary         = $summaryText
         Info            = [string[]]$infoLines.ToArray()
@@ -843,6 +997,40 @@ function Resolve-MinMaxPair {
         $result.Warning = "$($MaxSource): $MaxKey=$MaxValue is below the shipped $MinKey $MinValue; lowering $MinKey to $MaxValue."
     } else {
         $result.Error = "$MinKey=$MinValue is above $MaxKey=$MaxValue in the shipped values. Set $MinKey no higher than $MaxKey."
+    }
+    return $result
+}
+
+function Resolve-GeneratedPasswordLength {
+    <#
+    .SYNOPSIS
+        The length generated passwords use: PasswordLength, raised to the domain's
+        effective minimum when it is shorter.
+    .DESCRIPTION
+        The domain's minimum is never lowered, so a password shorter than it would be
+        refused when the account is created. No AD call. Never throws.
+    .PARAMETER PasswordLength
+        The PasswordLength value in force.
+    .PARAMETER Source
+        Where it was set: "Command line", "Override file '<path>'" or
+        "Initialize-ADDirectory.ps1" for the parameter's own default.
+    .PARAMETER MinPasswordLength
+        The effective MinPasswordLength, after the clamp to 14.
+    .OUTPUTS
+        PSCustomObject with Length (the larger of the two) and Warning ($null, or one line
+        when the length was raised).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param (
+        [Parameter(Mandatory)][int]$PasswordLength,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Source,
+        [Parameter(Mandatory)][int]$MinPasswordLength
+    )
+    $result = [pscustomobject]@{ Length = $PasswordLength; Warning = $null }
+    if ($PasswordLength -lt $MinPasswordLength) {
+        $result.Length  = $MinPasswordLength
+        $result.Warning = "$($Source): PasswordLength=$PasswordLength is below the effective MinPasswordLength $MinPasswordLength; generated passwords use $MinPasswordLength characters, and the domain's minimum stays $MinPasswordLength."
     }
     return $result
 }

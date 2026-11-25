@@ -30,10 +30,13 @@
     Initialize-Logging -LogPathParam $logPath -ScriptNameParam "New-ADForestDeployment.ps1" -CsvLogPathParam $csvErrorLogPath
     Write-LogInfo "Starting deployment."
 .NOTES
-    Version:      2.1.0
+    Version:      2.2.0
     Author:       Daniel Owen
-    Release Date: 2026-11-12
+    Release Date: 2026-11-25
+    SPDX-License-Identifier: MIT
     Requirements: PowerShell 5.1+
+.LINK
+    https://github.com/0x44616e69656c/new-AdDomain
 #>
 
 #region Module-Level Logging State

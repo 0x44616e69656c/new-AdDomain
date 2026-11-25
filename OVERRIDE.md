@@ -15,6 +15,8 @@ For example, with settings at their shipped values:
 }
 ```
 
+To start from a file that lists every key, copy [examples\overrides.psd1](examples/overrides.psd1) to `overrides\overrides.psd1`. Every key in it is commented out at its shipped value, so the copy changes nothing until you remove a `#` and set your own value.
+
 To make the file from an older copy of the project, see [UPGRADE.md](UPGRADE.md).
 
 ## Precedence
@@ -37,6 +39,7 @@ With no override file, a run logs one INFO line saying so, and the shipped setti
 | `CaValidityYears` | How many years the CA certificate is valid. | `overrides\overrides.psd1`, key `CaValidityYears`. | 5 | A whole number from 1 to 20. | The shipped value since 1.0. | no |
 | `ComputerCount` | The default of `-ComputerCount`, described in the README and the script's help. | `overrides\overrides.psd1`, key `ComputerCount`. `-ComputerCount` on the command line also sets it, and the command line wins. | 0 | A whole number of 0 or more. | The parameter's default since 1.0, which creates no computer objects. | no |
 | `DnsForwarders` | The DNS forwarders set on the DC. | `overrides\overrides.psd1`, key `DnsForwarders`. | `1.1.1.1`, `8.8.8.8` | A list of 1 or more items, each an IPv4 address. A single address is taken as a list of one. | Two public resolvers, Cloudflare's and Google's, the shipped value since 1.0. | no |
+| `DomainAdminCount` | The default of `-DomainAdminCount`, described in the README and the script's help. | `overrides\overrides.psd1`, key `DomainAdminCount`. A build profile also sets it, and the profile wins. `-DomainAdminCount` on the command line also sets it, and the command line wins. | Random, a count from MinDA to MaxDA | A whole number from 0 to 2147483647. A build profile also takes Random. A fixed count here wins over MinDA and MaxDA. | The parameter's behavior since 1.0. | no |
 | `DomainMode` | The domain functional level. | `overrides\overrides.psd1`, key `DomainMode`. A build profile also sets it, and the profile wins. | `WinThreshold` | WinThreshold or Win2025, never lower than ForestMode. A lower one is raised with a WARN. | The highest level every supported Windows Server release can run. | no |
 | `DomainName` | The DNS name of the forest root domain the build creates. | `overrides\overrides.psd1`, key `DomainName`. A build profile also sets it, and the profile wins. | `lab.test` | Two or more labels of letters, digits and hyphens, 64 characters at most. | RFC 2606 reserves .test for testing. Release 1.0 used lab.local, and RFC 6762 reserves .local for multicast DNS. | no |
 | `DsrmPassword` | The Directory Services Restore Mode password set when the DC is promoted. | `overrides\overrides.psd1`, key `DsrmPassword`. | the lab password set in New-ADForestDeployment.ps1 | Text of 8 to 127 characters. Install-ADDSForest's own password rules apply on top. | A fixed lab password, so a build needs no input. Never use it outside a lab. | yes |
@@ -53,20 +56,21 @@ With no override file, a run logs one INFO line saying so, and the shipped setti
 | `MinCompanyCount` | The fewest companies chosen for a run. Every generated user works for one of them. | `overrides\overrides.psd1`, key `MinCompanyCount`. | 1 | A whole number from 1 to 100. A value above MaxCompanyCount is used as MaxCompanyCount. | The shipped value since 1.0. | no |
 | `MinDA` | The default of `-MinDA`, described in the README and the script's help. | `overrides\overrides.psd1`, key `MinDA`. `-MinDA` on the command line also sets it, and the command line wins. | 2 | A whole number of 0 or more. A value above MaxDA moves the one you didn't set to the other's value with a WARN, and stops the run only when you set both. | The parameter's default since 1.0. | no |
 | `MinGroupMembers` | The default of `-MinGroupMembers`, described in the README and the script's help. | `overrides\overrides.psd1`, key `MinGroupMembers`. `-MinGroupMembers` on the command line also sets it, and the command line wins. | 2 | A whole number of 0 or more. A value above MaxGroupMembers moves the one you didn't set to the other's value with a WARN, and stops the run only when you set both. | The parameter's default since 1.0. | no |
-| `MinPasswordLength` | The minimum password length in the domain password policy. | `overrides\overrides.psd1`, key `MinPasswordLength`. | 14 | A whole number from 0 to 128. 15 to 128 builds with 14 and a WARN, because the domain enforces at most 14 unless Relax minimum password length limits is enabled on every DC. | The most the domain enforces without that setting. Releases 1.0 and 2.0 shipped 15, which the domain enforced as 14. | no |
+| `MinPasswordLength` | The minimum password length in the domain password policy, capped at 14. | `overrides\overrides.psd1`, key `MinPasswordLength`. | 14 | A whole number from 0 to 128. 15 to 128 builds with 14 and a WARN. The domain enforces more than 14 only when every DC runs Windows Server 2022 or later and has Relax minimum password length limits enabled, and the build enables that policy on no DC. The functional levels play no part. | The most the domain enforces without that setting. Releases 1.0 and 2.0 shipped 15, which the domain enforced as 14. | no |
 | `NetBIOSName` | The NetBIOS name of the domain. | `overrides\overrides.psd1`, key `NetBIOSName`. A build profile also sets it, and the profile wins. | `LAB` | 1 to 15 letters, digits or hyphens, not digits only and not a reserved word. With DomainName set and NetBIOSName left out, the first label of DomainName, upper-cased, is used with a WARN. | The first label of the shipped domain, upper-cased. | no |
 | `NtpServers` | The time servers the DC syncs from. | `overrides\overrides.psd1`, key `NtpServers`. | `time.windows.com` | A list of 1 or more items, each a host name or an IPv4 address. A single name is taken as a list of one. | Microsoft's public time server, the shipped value since 1.0. | no |
 | `PasswordHistoryCount` | How many old passwords the domain password policy remembers. | `overrides\overrides.psd1`, key `PasswordHistoryCount`. | 24 | A whole number from 0 to 24. | The shipped value since 1.0. | no |
-| `PasswordLength` | The default of `-PasswordLength`, described in the README and the script's help. | `overrides\overrides.psd1`, key `PasswordLength`. `-PasswordLength` on the command line also sets it, and the command line wins. | 20 | A whole number from 4 to 94. A length below MinPasswordLength gives a WARN that generated passwords are shorter than the policy, and the build carries on. | The parameter's default since 1.0. | no |
+| `PasswordLength` | The default of `-PasswordLength`, described in the README and the script's help. | `overrides\overrides.psd1`, key `PasswordLength`. `-PasswordLength` on the command line also sets it, and the command line wins. | 20 | A whole number from 4 to 94. A length below the effective MinPasswordLength, or below the minimum the domain enforces before script two sets its policy, is raised to the larger with a WARN, so generated passwords always meet the domain policy. | The parameter's default since 1.0. | no |
 | `PctDisabled` | The percentage of generated users that are disabled and moved to the DisabledUsers OU. | `overrides\overrides.psd1`, key `PctDisabled`. | 5 | A whole number from 0 to 100. The five user-state percentages must sum to 100 or less. Above that, the shipped ones you left alone are lowered with a WARN, and the run stops only when the ones you set sum above 100. | The shipped value since 1.0. | no |
 | `PctLocked` | The percentage of generated users that are locked out. | `overrides\overrides.psd1`, key `PctLocked`. | 2 | A whole number from 0 to 100. One of the five user-state percentages, which must sum to 100 or less, as PctDisabled says. | The shipped value since 1.0. | no |
 | `PctPwExpired` | The percentage of generated users that must change their password at the next logon. | `overrides\overrides.psd1`, key `PctPwExpired`. | 5 | A whole number from 0 to 100. One of the five user-state percentages, which must sum to 100 or less, as PctDisabled says. | The shipped value since 1.0. | no |
 | `PctPwNeverExpires` | The percentage of generated users whose password never expires. | `overrides\overrides.psd1`, key `PctPwNeverExpires`. | 10 | A whole number from 0 to 100. One of the five user-state percentages, which must sum to 100 or less, as PctDisabled says. | The shipped value since 1.0. | no |
 | `PctRemoteUsers` | The percentage of generated users given a random city of their own. The rest share one city picked for the run. | `overrides\overrides.psd1`, key `PctRemoteUsers`. | 30 | A whole number from 0 to 100. | The shipped value since 1.0. | no |
 | `PctSmartcard` | The percentage of generated users that need a smart card to log on. | `overrides\overrides.psd1`, key `PctSmartcard`. | 3 | A whole number from 0 to 100. One of the five user-state percentages, which must sum to 100 or less, as PctDisabled says. | The shipped value since 1.0. | no |
+| `Population` | The default of `-Population`, described in the README and the script's help. | `overrides\overrides.psd1`, key `Population`. A build profile also sets it, and the profile wins. `-Population` on the command line also sets it, and the command line wins. | `Full` | One of Full, Minimal, None. A Population from the command line or a build profile wins over this file's UserCount and the other counts. | What every release since 1.0 built. | no |
 | `PrimarySiteName` | The name of the AD site the DC is put in. | `overrides\overrides.psd1`, key `PrimarySiteName`. A build profile also sets it, and the profile wins. | `Lab-HQ` | 1 to 63 letters, digits or hyphens, starting with a letter or digit and not ending with a hyphen. | The shipped value since 1.0. | no |
 | `PrimarySubnet` | The subnet given to the DC's site. | `overrides\overrides.psd1`, key `PrimarySubnet`. A build profile also sets it, and the profile wins. | `Auto` | Auto, or an IPv4 subnet in CIDR form with a prefix of 8 to 30, such as 192.168.159.0/24. | Auto uses the subnet the DC's own address sits in, the only value that is right on every host. | no |
-| `RandomSeed` | The default of `-RandomSeed`, described in the README and the script's help. | `overrides\overrides.psd1`, key `RandomSeed`. `-RandomSeed` on the command line also sets it, and the command line wins. | 0 | A whole number of 0 or more. | The parameter's default since 1.0. 0 sets no seed, so each run differs. | no |
+| `RandomSeed` | The default of `-RandomSeed`, described in the README and the script's help. | `overrides\overrides.psd1`, key `RandomSeed`. A build profile also sets it as `PopulationSeed`, and the profile wins. `-RandomSeed` on the command line also sets it, and the command line wins. | 0 | A whole number of 0 or more. A build profile sets the seed as PopulationSeed, writes Random for 0 and refuses 0. | The parameter's default since 1.0. 0 draws a seed, logs it and reports it, so each run differs and can be repeated. | no |
 | `RequiredOSBuild` | The oldest Windows build script one runs on. | `overrides\overrides.psd1`, key `RequiredOSBuild`. A build profile also sets it, and the profile wins. | 26100 | A whole number. Below 17763 is raised to 17763, and below 26100 to 26100 when either level is Win2025, each with a WARN. | Server 2025 (build 26100) is the only tested release. | no |
 | `ServerPrefix` | The name prefix of generated server computer objects. | `overrides\overrides.psd1`, key `ServerPrefix`. | `SRV` | 1 to 6 letters or digits. | The shipped value since 1.0. | no |
 | `UpnPattern` | The form of each generated user's UPN. | `overrides\overrides.psd1`, key `UpnPattern`. | `firstlast` | Any text. firstlast gives first.last, f_last gives f_last, and anything else gives the account name, each at the domain. | firstlast can't collide, because the generated display names are unique. | no |
@@ -77,12 +81,16 @@ With no override file, a run logs one INFO line saying so, and the shipped setti
 
 A build profile, `include\build-profile.psd1`, sets the keys below for one build, and wins over the override file. How to use one is in the README. A key the profile leaves out takes the override file's value, then the shipped value, with one INFO line. An empty key falls back the same way, with a WARN.
 
-The keys a build profile takes, each with its permitted values under [Settings](#settings):
+The keys a build profile takes, each with its permitted values under [Settings](#settings) or where its line points:
 
+- [`DomainAdminCount`](#settings)
 - [`DomainMode`](#settings)
 - [`DomainName`](#settings)
 - [`ForestMode`](#settings)
 - [`NetBIOSName`](#settings)
+- `NetworkType`, described in [build-lab's OVERRIDE.md](https://github.com/0x44616e69656c/build-lab/blob/main/OVERRIDE.md)
+- [`Population`](#settings)
+- `PopulationSeed`, which sets [`RandomSeed`](#settings)
 - [`PrimarySiteName`](#settings)
 - [`PrimarySubnet`](#settings)
 - [`RequiredOSBuild`](#settings)
@@ -91,12 +99,8 @@ A build profile refuses these keys until their feature exists, so that a profile
 
 - `BuildName`
 - `CertificateAuthority`
-- `DomainAdminCount`
 - `Machines`
-- `Population`
-- `RandomSeed`
 - `Trusts`
-- `VirtualNetwork`
 
 ## Retired keys
 
@@ -129,6 +133,7 @@ These can't be set in the override file.
 | `AdapterName` | A parameter of script one, given for each server. |
 | `CreateScheduledTask` | A parameter of script one, chosen for each run. |
 | `DefaultGateway` | A parameter of script one, given for each server. |
+| `LaunchId` | Set by build-lab for each launch. |
 | `NonInteractive` | A parameter of script one, chosen for each run. |
 | `PrefixLength` | A parameter of script one, given for each server. |
 | `StaticIpAddress` | A parameter of script one, given for each server. |

@@ -64,9 +64,10 @@
     Export-OverrideFile_<yyyyMMdd-HHmmss>.csv in -LogPath, one row per setting. Exit code
     0 on success or after -WhatIf, 1 when the run stops.
 .NOTES
-    Version: 2.1.0
+    Version: 2.2.0
     Author: Daniel Owen
-    Release Date: 2026-11-12
+    Release Date: 2026-11-25
+    SPDX-License-Identifier: MIT
     Requirements: Windows PowerShell 5.1. The include folder beside this script, with
         OverrideFile.ps1, Logging.ps1, Sanitization.ps1, BuildProfile.ps1,
         override-catalog.psd1 and release-values.psd1. Run logs are kept, never pruned.
@@ -74,6 +75,8 @@
         include\override-catalog.psd1
     Event Log Source: N/A
     Setup: N/A
+.LINK
+    https://github.com/0x44616e69656c/new-AdDomain
 #>
 
 #Requires -Version 5.1
@@ -313,7 +316,7 @@ function Write-MigrationFile {
 #region Variables
 
 $scriptName = 'Export-OverrideFile.ps1'
-$scriptVersion = '2.1.0'
+$scriptVersion = '2.2.0'
 $runStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 if (-not $LogPath) { $LogPath = Join-Path -Path $PSScriptRoot -ChildPath 'logs' }
 $LogPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogPath)

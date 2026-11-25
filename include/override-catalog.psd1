@@ -155,8 +155,8 @@
             Name          = 'minPasswordLength'
             Shipped       = 14
             Rule          = @{ Type = 'Integer'; Minimum = 0; Maximum = 128 }
-            Summary       = 'The minimum password length in the domain password policy'
-            ValuesNote    = '15 to 128 builds with 14 and a WARN, because the domain enforces at most 14 unless Relax minimum password length limits is enabled on every DC'
+            Summary       = 'The minimum password length in the domain password policy, capped at 14'
+            ValuesNote    = '15 to 128 builds with 14 and a WARN. The domain enforces more than 14 only when every DC runs Windows Server 2022 or later and has Relax minimum password length limits enabled, and the build enables that policy on no DC. The functional levels play no part'
             ShippedReason = 'The most the domain enforces without that setting. Releases 1.0 and 2.0 shipped 15, which the domain enforced as 14'
         }
         PasswordHistoryCount = @{
@@ -272,6 +272,7 @@
         UserCount = @{
             Target        = 'Parameter'
             Name          = 'UserCount'
+            ExampleNote   = 'How many users script two creates'
             Shipped       = 1000
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ShippedReason = 'The parameter''s default since 1.0'
@@ -279,6 +280,7 @@
         GroupCount = @{
             Target        = 'Parameter'
             Name          = 'GroupCount'
+            ExampleNote   = 'How many groups script two creates before nesting them'
             Shipped       = 50
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ShippedReason = 'The parameter''s default since 1.0'
@@ -286,6 +288,7 @@
         ComputerCount = @{
             Target        = 'Parameter'
             Name          = 'ComputerCount'
+            ExampleNote   = 'How many computer objects script two creates'
             Shipped       = 0
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ShippedReason = 'The parameter''s default since 1.0, which creates no computer objects'
@@ -293,13 +296,15 @@
         PasswordLength = @{
             Target        = 'Parameter'
             Name          = 'PasswordLength'
+            ExampleNote   = 'The length of each generated password'
             Shipped       = 20
-            ValuesNote    = 'A length below MinPasswordLength gives a WARN that generated passwords are shorter than the policy, and the build carries on'
+            ValuesNote    = 'A length below the effective MinPasswordLength, or below the minimum the domain enforces before script two sets its policy, is raised to the larger with a WARN, so generated passwords always meet the domain policy'
             ShippedReason = 'The parameter''s default since 1.0'
         }
         MinGroupMembers = @{
             Target        = 'Parameter'
             Name          = 'MinGroupMembers'
+            ExampleNote   = 'The fewest members each generated group gets'
             Shipped       = 2
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ValuesNote    = 'A value above MaxGroupMembers moves the one you didn''t set to the other''s value with a WARN, and stops the run only when you set both'
@@ -308,6 +313,7 @@
         MaxGroupMembers = @{
             Target        = 'Parameter'
             Name          = 'MaxGroupMembers'
+            ExampleNote   = 'The most members each generated group gets'
             Shipped       = 10
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ValuesNote    = 'A value below MinGroupMembers is handled as MinGroupMembers says'
@@ -316,6 +322,7 @@
         MinDA = @{
             Target        = 'Parameter'
             Name          = 'MinDA'
+            ExampleNote   = 'The fewest generated users added to Domain Admins'
             Shipped       = 2
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ValuesNote    = 'A value above MaxDA moves the one you didn''t set to the other''s value with a WARN, and stops the run only when you set both'
@@ -324,6 +331,7 @@
         MaxDA = @{
             Target        = 'Parameter'
             Name          = 'MaxDA'
+            ExampleNote   = 'The most generated users added to Domain Admins'
             Shipped       = 10
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ValuesNote    = 'A value below MinDA is handled as MinDA says'
@@ -332,6 +340,7 @@
         MaxGroupNestingDepth = @{
             Target        = 'Parameter'
             Name          = 'MaxGroupNestingDepth'
+            ExampleNote   = 'The deepest group-in-group nesting'
             Shipped       = 3
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
             ShippedReason = 'The parameter''s default since 1.0'
@@ -339,9 +348,29 @@
         RandomSeed = @{
             Target        = 'Parameter'
             Name          = 'RandomSeed'
+            ExampleNote   = 'The seed for the random draws, so a population can be repeated'
             Shipped       = 0
             Rule          = @{ Type = 'Integer'; Minimum = 0 }
-            ShippedReason = 'The parameter''s default since 1.0. 0 sets no seed, so each run differs'
+            ValuesNote    = 'A build profile sets the seed as PopulationSeed, writes Random for 0 and refuses 0'
+            ShippedReason = 'The parameter''s default since 1.0. 0 draws a seed, logs it and reports it, so each run differs and can be repeated'
+        }
+        Population = @{
+            Target        = 'Parameter'
+            Name          = 'Population'
+            ExampleNote   = 'How much lab data script two creates'
+            Shipped       = 'Full'
+            Rule          = @{ Type = 'String'; Allowed = @('Full', 'Minimal', 'None') }
+            ValuesNote    = 'A Population from the command line or a build profile wins over this file''s UserCount and the other counts'
+            ShippedReason = 'What every release since 1.0 built'
+        }
+        DomainAdminCount = @{
+            Target        = 'Parameter'
+            Name          = 'DomainAdminCount'
+            ExampleNote   = 'How many generated users are added to Domain Admins'
+            ShippedText   = 'Random, a count from MinDA to MaxDA'
+            Rule          = @{ Type = 'Integer'; Minimum = 0; Maximum = 2147483647 }
+            ValuesNote    = 'A build profile also takes Random. A fixed count here wins over MinDA and MaxDA'
+            ShippedReason = 'The parameter''s behavior since 1.0'
         }
         DsrmPassword = @{
             Target        = 'Constant'
@@ -355,7 +384,7 @@
         }
     }
     Siblings = @{
-        'build-lab'               = @('VmName', 'ComputerName', 'RamMB', 'CpuCount', 'DiskGB', 'NetworkType', 'SubnetMask', 'DefaultGateway', 'DnsServer', 'TimeoutMinutes', 'GuestReadyTimeoutMinutes', 'DeploymentTimeoutMinutes', 'MemberServerCount', 'MemberRamMB', 'MemberCpuCount', 'MemberDiskGB', 'DomainJoinTimeoutMinutes', 'VmBuilderScriptPath', 'AdDomainSourcePath', 'EnableEventLogging', 'MaxMemberServerCount')
+        'build-lab'               = @('VmName', 'ComputerName', 'RamMB', 'CpuCount', 'DiskGB', 'NetworkType', 'SubnetMask', 'DefaultGateway', 'DnsServer', 'TimeoutMinutes', 'GuestReadyTimeoutMinutes', 'DeploymentTimeoutMinutes', 'MemberServerCount', 'MemberRamMB', 'MemberCpuCount', 'MemberDiskGB', 'DomainJoinTimeoutMinutes', 'VmBuilderScriptPath', 'AdDomainSourcePath', 'EnableEventLogging', 'MaxMemberServerCount', 'DeferPopulation', 'PopulationTimeoutMinutes')
         'New-VMwareWorkstationVM' = @('VmName', 'RamMB', 'CpuCount', 'DiskGB', 'ComputerName', 'TimeZone', 'Edition', 'NetworkType', 'SubnetMask', 'DefaultGateway', 'DnsServer', 'TimeoutMinutes', 'PostSetupDelayMinutes', 'ShutdownTimeoutMinutes', 'RestartTimeoutMinutes', 'LogPath', 'TempPath', 'ShowConsole', 'ProductKey', 'ImageNameStandard', 'ImageNameDatacenter', 'GuestOS', 'InputLocale', 'SystemLocale', 'UserLocale', 'Organization')
     }
     Document = @{
@@ -384,6 +413,7 @@
             @{ Name = 'PrefixLength'; Reason = 'A parameter of script one, given for each server' }
             @{ Name = 'DefaultGateway'; Reason = 'A parameter of script one, given for each server' }
             @{ Name = 'AdapterName'; Reason = 'A parameter of script one, given for each server' }
+            @{ Name = 'LaunchId'; Reason = 'Set by build-lab for each launch' }
         )
         CsvReplacements = @(
             @{ File = 'first.csv'; Holds = 'The first names users are built from'; Headers = @('FirstName') }
@@ -402,6 +432,12 @@
             'In a build-lab run the whole project folder, the overrides folder and DsrmPassword included, is copied into the guest and stays at `C:\temp\new-AdDomain` on the DC after the build'
             'A standalone run reads the file where it is, on the server you run the scripts on'
         )
-        BuildProfile    = @{ Script = 'include\BuildProfile.ps1' }
+        BuildProfile    = @{
+            Script   = 'include\BuildProfile.ps1'
+            Pointers = @{
+                NetworkType    = @{ Project = 'build-lab' }
+                PopulationSeed = @{ Key = 'RandomSeed' }
+            }
+        }
     }
 }

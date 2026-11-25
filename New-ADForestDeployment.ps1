@@ -7,6 +7,12 @@
     optionally registers a scheduled task to auto-run Initialize-ADDirectory.ps1
     after the promotion reboot, and initiates the reboot.
 
+    Population, Initialize-ADDirectory.ps1, runs only when something starts it after
+    the reboot. build-lab starts it unattended over guest operations and leaves this
+    script's -CreateScheduledTask off, unless its own -DeferPopulation asks for the
+    logon task. On a standalone build, -CreateScheduledTask starts it at the next
+    Administrator logon, or you run it by hand.
+
     Domain identity ($domainName, $netBIOSName) is read from
     include\global-config.ps1, the single source of truth shared with
     Initialize-ADDirectory.ps1. To deploy a different domain, place a build profile at
@@ -50,14 +56,17 @@
     .\New-ADForestDeployment.ps1
     .\New-ADForestDeployment.ps1 -CreateScheduledTask
 .EXAMPLE
-    # Unattended (no prompts) -- used by build-lab.ps1 over vmrun guest operations.
-    .\New-ADForestDeployment.ps1 -CreateScheduledTask -NonInteractive `
+    # Unattended (no prompts), as build-lab.ps1 runs it over vmrun guest operations.
+    .\New-ADForestDeployment.ps1 -NonInteractive `
         -StaticIpAddress '192.168.1.50' -PrefixLength 24 -DefaultGateway '192.168.1.1'
 .NOTES
-    Version:      2.1.0
+    Version:      2.2.0
     Author:       Daniel Owen
-    Release Date: 2026-11-12
+    Release Date: 2026-11-25
+    SPDX-License-Identifier: MIT
     Requirements: Windows Server 2025, PowerShell 5.1+, local Administrator
+.LINK
+    https://github.com/0x44616e69656c/new-AdDomain
 #>
 
 #region Parameters
@@ -107,7 +116,7 @@ if (-not (Test-Path $logFuncsPath)) {
 
 #region Script-Local Configuration
 # Equal to the Version line above. The "started" line logs it.
-$scriptVersion               = '2.1.0'
+$scriptVersion               = '2.2.0'
 # The oldest include\global-config.ps1 this script runs with: the first with the
 # override file.
 $requiredGlobalConfigVersion = '2.1.0'
@@ -445,7 +454,7 @@ function Show-PostPromotionManualStepNotice {
         ' ONLY at the next Administrator logon.',
         '',
         ' Log into this server as Administrator after the reboot to start directory',
-        ' population. It removes its own scheduled task and reboots when finished.',
+        ' population. It removes its own scheduled task when finished.',
         '================================================================================',
         ''
     )
@@ -535,7 +544,7 @@ try {
         Write-LogWarn "Directory population has NOT run yet. Initialize-ADDirectory.ps1 runs only at the next Administrator logon. Log into this server as Administrator after the reboot to start it."
         Show-PostPromotionManualStepNotice
     } else {
-        Write-LogInfo "Scheduled task not requested. Run Initialize-ADDirectory.ps1 manually after reboot."
+        Write-LogInfo "Scheduled task not requested. Initialize-ADDirectory.ps1 runs only when started: by build-lab after the reboot, or by hand."
     }
 
     Write-LogSuccess "New-ADForestDeployment.ps1 complete. Rebooting now."
